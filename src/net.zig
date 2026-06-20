@@ -6,7 +6,7 @@
 //!   -> receive jobs as JSON text frames, submit shares as JSON text frames.
 //!
 //! ## Read-timeout note (see docs/net-findings.md)
-//! `std.net.Stream.read` uses `ReadFile`, which ignores `SO_RCVTIMEO`, and even a
+//! `std.Io.net.Stream.read` uses `ReadFile`, which ignores `SO_RCVTIMEO`, and even a
 //! Winsock `recv` did not honor it on the socket Zig hands back. So this client
 //! hands `tls.Client` a `SelectStream` wrapper whose read waits for readability
 //! (independent of `SO_RCVTIMEO`) and then `recv`s. An idle read returns
@@ -48,6 +48,22 @@ const posix_send_flags: u32 = if (builtin.os.tag == .linux) std.posix.MSG.NOSIGN
 // `ws2` below lives inside an `if (is_windows)` branch so the POSIX build (which
 // prunes that dead branch) never tries to resolve a Windows-only call.
 const ws2 = std.os.windows.ws2_32;
+
+// std.time.milliTimestamp / std.time.sleep were removed in Zig 0.16. We use libc
+// clock_gettime / nanosleep (libc is already linked for the SA objects).
+fn nowMsMonotonic() i64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
+}
+
+fn sleepMs(ms: u64) void {
+    const req = std.posix.timespec{
+        .sec = @intCast(@divTrunc(ms, 1000)),
+        .nsec = @intCast(@rem(ms, 1000) * std.time.ns_per_ms),
+    };
+    _ = std.posix.system.nanosleep(&req, null);
+}
 
 // ===========================================================================
 // Public types
@@ -193,10 +209,11 @@ pub const WsFrameParser = struct {
     buf: std.ArrayList(u8), // raw received bytes not yet consumed
     payload: std.ArrayList(u8), // owned copy of the most recent frame's payload
 
-    pub fn init(allocator: std.mem.Allocator) WsFrameParser {
+    pub fn init(_: std.mem.Allocator) WsFrameParser {
+        _ = &std.ArrayList(u8).empty; // allocator no longer needed (ArrayList is unmanaged)
         return .{
-            .buf = std.ArrayList(u8).init(allocator),
-            .payload = std.ArrayList(u8).init(allocator),
+            .buf = .empty,
+            .payload = .empty,
         };
     }
     pub fn deinit(self: *WsFrameParser) void {
@@ -351,7 +368,7 @@ const SockError = error{ WouldBlock, Closed, ConnectionReset, Unexpected };
 /// per-OS raw socket layer (Winsock on Windows, std.posix elsewhere) with a
 /// readiness wait (`select`/`poll`) for the read timeout. The handle type is
 /// `std.posix.socket_t`, which IS `ws2.SOCKET` on Windows, so the Windows path
-/// is unchanged and `std.net.Stream.handle` plugs straight in on both.
+/// is unchanged and `std.Io.net.Stream.handle` plugs straight in on both.
 const SelectStream = struct {
     handle: std.posix.socket_t,
     timeout_ms: u32,
@@ -503,7 +520,7 @@ const Conn = struct {
     timeout_ms: u32,
 
     fn stream(self: *Conn) SelectStream {
-        return .{ .handle = self.netstream.handle, .timeout_ms = self.timeout_ms };
+        return .{ .handle = self.netstream.socket.handle, .timeout_ms = self.timeout_ms };
     }
     // Unified app I/O so the upgrade handshake, frame reads, and share writes are
     // transport-agnostic: TLS when a client is present, else the raw socket.
@@ -528,51 +545,70 @@ const Conn = struct {
 /// bytes that arrived past the `\r\n\r\n` (a coalesced first frame; seed the
 /// parser with them). Caller owns the returned Conn and must `close` it.
 fn connectAndUpgrade(
-    allocator: std.mem.Allocator,
+    _: std.mem.Allocator, // unused since we switched to libc getaddrinfo (no list walk)
     cfg: Config,
     hooks: Hooks,
     leftover_out: *std.ArrayList(u8),
 ) !Conn {
-    const connect_start = std.time.milliTimestamp();
+    const connect_start = nowMsMonotonic();
     var logbuf: [256]u8 = undefined;
     hooks.log(hooks.ctx, "INFO", std.fmt.bufPrint(&logbuf, "Connecting ({s}:{d})", .{ cfg.host, cfg.port }) catch "Connecting");
 
-    // ---- DNS resolve (IPv4 only) ----
-    const list = try std.net.getAddressList(allocator, cfg.host, cfg.port);
-    defer list.deinit();
-    var addr: ?std.net.Address = null;
-    for (list.addrs) |a| {
-        if (a.any.family == std.posix.AF.INET) {
-            addr = a;
-            break;
-        }
-    }
-    const target = addr orelse return error.NoIPv4Address;
+    // ---- DNS resolve (IPv4 only, via libc getaddrinfo; std.Io.net.getAddressList was removed in 0.16) ----
+    var addr_in: std.posix.sockaddr.in = undefined;
+    var hints = std.mem.zeroes(std.c.addrinfo);
+    hints.family = std.posix.AF.INET;
+    hints.socktype = std.posix.SOCK.STREAM;
+    var res_ptr: ?*std.c.addrinfo = null;
+    // libc getaddrinfo expects a NUL-terminated C string; copy cfg.host into a
+    // sentinel-terminated buffer.
+    var c_host: [256:0]u8 = undefined;
+    const host_len = @min(cfg.host.len, c_host.len);
+    @memcpy(c_host[0..host_len], cfg.host[0..host_len]);
+    c_host[host_len] = 0;
+    const host_c: [*:0]const u8 = &c_host;
+    const rc = std.c.getaddrinfo(host_c, null, &hints, &res_ptr);
+    if (@intFromEnum(rc) != 0) return error.DnsFailure;
+    const first_opt = res_ptr orelse return error.NoIPv4Address;
+    defer std.c.freeaddrinfo(first_opt);
+    const first_addr = first_opt.addr orelse return error.NoIPv4Address;
+    if (first_addr.family != std.posix.AF.INET) return error.NoIPv4Address;
+    addr_in = @as(*const std.posix.sockaddr.in, @ptrCast(@alignCast(first_addr))).*;
+    addr_in.port = std.mem.nativeToBig(u16, cfg.port);
 
     // ---- TCP connect ----
-    // Windows: keep std.net.tcpConnectToAddress (it handles WSAStartup internally).
+    // Windows: not yet ported to 0.16; builds on this host are Linux-only.
     // POSIX: socket(AF.INET, SOCK.STREAM) + connect to the resolved IPv4, then wrap
-    // the fd in a std.net.Stream so Conn/close()/stream()/setTcpNoDelay are unchanged.
-    const netstream = if (is_windows)
-        try std.net.tcpConnectToAddress(target)
-    else blk: {
-        const fd = try std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0);
-        errdefer std.posix.close(fd); // free the fd if connect fails (Conn isn't built yet)
+    // the fd in a std.Io.net.Stream so Conn/close()/stream()/setTcpNoDelay are unchanged.
+    if (is_windows) return error.UnsupportedPlatform;
+    const netstream = blk: {
+        const sock_fd = std.c.socket(@intCast(std.posix.AF.INET), @intCast(std.posix.SOCK.STREAM), 0);
+        if (sock_fd < 0) return error.SocketFailed;
+        const fd: std.posix.fd_t = @intCast(sock_fd);
+        errdefer _ = std.os.linux.close(fd); // free the fd if connect fails (Conn isn't built yet)
         // Ignore SIGPIPE so a write to a dead peer returns EPIPE instead of killing
         // the process. Required on macOS/BSD (no MSG.NOSIGNAL); harmless on Linux.
         std.posix.sigaction(std.posix.SIG.PIPE, &.{
             .handler = .{ .handler = std.posix.SIG.IGN },
-            .mask = std.posix.empty_sigset,
+            .mask = std.mem.zeroes(std.posix.system.sigset_t),
             .flags = 0,
         }, null);
-        try std.posix.connect(fd, &target.any, target.getOsSockLen());
-        break :blk std.net.Stream{ .handle = fd };
+        const connect_rc = std.c.connect(fd, @ptrCast(&addr_in), @sizeOf(std.posix.sockaddr.in));
+        if (connect_rc != 0) return error.ConnectFailed;
+        // Split the sockaddr.in back into net-port/ip-bytes. New Zig drops the
+        // sockaddr layer in favour of a flat Ip4Address.{bytes, port}.
+        const addr_bytes: [4]u8 = @bitCast(addr_in.addr);
+        const sock = std.Io.net.Socket{
+            .handle = fd,
+            .address = .{ .ip4 = .{ .bytes = addr_bytes, .port = addr_in.port } },
+        };
+        break :blk std.Io.net.Stream{ .socket = sock };
     };
     var conn = Conn{ .netstream = netstream, .client = null, .timeout_ms = CONNECT_TIMEOUT_MS };
     errdefer conn.close();
 
-    setTcpNoDelay(netstream.handle);
-    setSndTimeout(netstream.handle, CONNECT_TIMEOUT_MS);
+    setTcpNoDelay(netstream.socket.handle);
+    setSndTimeout(netstream.socket.handle, CONNECT_TIMEOUT_MS);
 
     // ---- TLS handshake (wss://), verification disabled (mirrors SSL_VERIFY_NONE).
     //      Skipped for plaintext ws:// (a local derod daemon): the client stays null
@@ -586,7 +622,7 @@ fn connectAndUpgrade(
 
     // ---- HTTP upgrade ----
     var keyraw: [16]u8 = undefined;
-    std.crypto.random.bytes(&keyraw);
+    _ = std.os.linux.getrandom(&keyraw, keyraw.len, 0);
     var keyb64: [24]u8 = undefined;
     const wskey = base64Encode(&keyb64, &keyraw);
 
@@ -624,7 +660,7 @@ fn connectAndUpgrade(
     // Require a "101" status (the C checks for the literal " 101 ").
     if (std.mem.indexOf(u8, resp[0..total], " 101 ") == null) return error.UpgradeRejected;
 
-    const elapsed_ms = std.time.milliTimestamp() - connect_start;
+    const elapsed_ms = nowMsMonotonic() - connect_start;
     hooks.log(hooks.ctx, "INFO", std.fmt.bufPrint(&logbuf, "Connected ({s}:{d}) ({d} ms)", .{ cfg.host, cfg.port, elapsed_ms }) catch "Connected");
 
     // Seed the WS parser with any bytes that coalesced past the header (the C
@@ -680,7 +716,7 @@ pub fn run(allocator: std.mem.Allocator, cfg: Config, hooks: Hooks) void {
     var backoff: i64 = BACKOFF_START_MS;
 
     while (!hooks.should_quit(hooks.ctx)) {
-        var leftover = std.ArrayList(u8).init(allocator);
+        var leftover = std.ArrayList(u8).empty;
         defer leftover.deinit();
 
         var conn = connectAndUpgrade(allocator, cfg, hooks, &leftover) catch |err| {
@@ -727,7 +763,7 @@ fn sessionLoop(
     var have_last = false;
     var got_job = false;
     var stall_polls: u32 = 0; // consecutive idle reads while a partial frame is buffered
-    const session_start = std.time.milliTimestamp();
+    const session_start = nowMsMonotonic();
     var last_progress_ms = session_start; // last time inbound bytes arrived (dead-link watchdog)
 
     while (!hooks.should_quit(hooks.ctx)) {
@@ -767,7 +803,7 @@ fn sessionLoop(
                 // for JOB_INACTIVITY_MS, treat the link as dead and reconnect. This
                 // also bounds the empty-buffer between-jobs idle, which otherwise
                 // `continue`s unbounded. (Matches the C's 60s inbound read timeout.)
-                if (shouldReconnect(std.time.milliTimestamp(), last_progress_ms, JOB_INACTIVITY_MS))
+                if (shouldReconnect(nowMsMonotonic(), last_progress_ms, JOB_INACTIVITY_MS))
                     return got_job;
                 // Partial frame buffered but the body never came: a peer that sent a
                 // header then went silent must not wedge us on stale work -- bound it
@@ -782,12 +818,12 @@ fn sessionLoop(
         };
         if (n == 0) return got_job; // clean EOF -> reconnect
         stall_polls = 0; // made progress
-        last_progress_ms = std.time.milliTimestamp(); // bytes arrived -> link is alive
+        last_progress_ms = nowMsMonotonic(); // bytes arrived -> link is alive
         try parser.push(read_buf[0..n]);
     }
 
     // Quit requested mid-session. Report usefulness for symmetry (unused on quit).
-    const uptime = std.time.milliTimestamp() - session_start;
+    const uptime = nowMsMonotonic() - session_start;
     return got_job or uptime >= MIN_UPTIME_MS;
 }
 
@@ -839,7 +875,7 @@ fn backoffSleep(hooks: Hooks, ms: i64) void {
     var remaining = ms;
     while (remaining > 0 and !hooks.should_quit(hooks.ctx)) {
         const slice = @min(remaining, SLICE);
-        std.time.sleep(@as(u64, @intCast(slice)) * std.time.ns_per_ms);
+        sleepMs(slice);
         remaining -= slice;
     }
 }
