@@ -65,9 +65,12 @@ fn nowLocal() LocalTime {
             .millis = @intCast(st.wMilliseconds),
         };
     } else {
-        // POSIX: localtime_r for the broken-down local fields, milliTimestamp for ms.
-        // libC is linked (build.zig: linkLibC). This branch is pruned on Windows.
-        const ms_total = std.time.milliTimestamp();
+        // POSIX: localtime_r for the broken-down local fields + clock_gettime(REAL)
+        // for sub-second millisecond precision. libC is linked (build.zig: linkLibC).
+        // std.time.milliTimestamp was removed in Zig 0.16.
+        var ts: std.posix.timespec = undefined;
+        _ = std.posix.system.clock_gettime(std.posix.CLOCK.REALTIME, &ts);
+        const ms_total: i128 = @as(i128, ts.sec) * 1000 + @divTrunc(@as(i128, ts.nsec), std.time.ns_per_ms);
         const t: c_long = @intCast(@divFloor(ms_total, 1000));
         var tm: CTm = undefined;
         _ = localtime_r(&t, &tm);

@@ -30,8 +30,12 @@ pub fn parseConfig(allocator: std.mem.Allocator, bytes: []const u8) !Config {
 
 /// Serialize a config to JSON in the exact shape we ship (the 3 keys). Used by `--setup`
 /// so the interactive launcher path and a hand-edited config.json stay one file/format.
+/// `writer` may be either the legacy `std.io.Writer` (for tests) or `std.Io.File.Writer`
+/// (in 0.16+, where `Writer` no longer has `.print`). We format into a fixed buffer and
+/// then route through whichever writeAll-style method the writer exposes.
 pub fn writeConfig(writer: anytype, daemon_address: []const u8, wallet: []const u8, threads: i64) !void {
-    try writer.print(
+    var buf: [1024]u8 = undefined;
+    const formatted = try std.fmt.bufPrint(&buf,
         \\{{
         \\  "daemon-address": "{s}",
         \\  "wallet": "{s}",
@@ -39,6 +43,25 @@ pub fn writeConfig(writer: anytype, daemon_address: []const u8, wallet: []const 
         \\}}
         \\
     , .{ daemon_address, wallet, threads });
+
+    const WriterType = @TypeOf(writer);
+    if (@hasField(WriterType, "interface")) {
+        // 0.16's `std.Io.File.Writer` exposes the underlying `Io.Writer` as `.interface`,
+        // but a value receiver arrives here as a `const` so we copy into a local to
+        // obtain a mutable reference for `writeAll` (which takes `*Io.Writer`).
+        var iface = writer.interface;
+        try iface.writeAll(formatted);
+    } else if (@hasDecl(WriterType, "writeAll")) {
+        try writer.writeAll(formatted);
+    } else {
+        // Legacy fallback: small loop over .write (rare; tests pass std.io.Writer).
+        var pos: usize = 0;
+        while (pos < formatted.len) {
+            const n = try writer.write(formatted[pos..]);
+            if (n == 0) return error.WriteFailed;
+            pos += n;
+        }
+    }
 }
 
 test "parseConfig: reads keys, ignores unknown, missing -> null" {
