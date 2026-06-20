@@ -416,7 +416,7 @@ pub fn main(init: std.process.Init) !u8 {
     // -c/--config-file override, scanned up-front (also consumed in the loop below).
     var explicit_cfg: ?[]const u8 = null;
     {
-        var j: usize = 1;
+        var j: usize = 0;
         while (j < args.len) : (j += 1) {
             if ((std.mem.eql(u8, args[j], "-c") or std.mem.eql(u8, args[j], "--config-file")) and j + 1 < args.len) {
                 explicit_cfg = args[j + 1];
@@ -440,7 +440,7 @@ pub fn main(init: std.process.Init) !u8 {
         if (!loaded) std.debug.print("config : no config.json found (next to the exe or in the working dir) -- using built-in defaults\n", .{});
     }
 
-    var i: usize = 1;
+    var i: usize = 0;
     while (i < args.len) : (i += 1) {
         const a = args[i];
         if (std.mem.eql(u8, a, "-d") and i + 1 < args.len) {
