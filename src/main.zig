@@ -15,6 +15,22 @@ const VERSION = "0.1.3";
 
 var G: state.MinerState = .{};
 
+// std.time.milliTimestamp / std.time.sleep were removed in Zig 0.16. We use the libc
+// clock_gettime / nanosleep wrappers we already link (build.zig: linkLibC, linkLibCpp).
+fn nowMsMonotonic() i64 {
+    var ts: std.posix.timespec = undefined;
+    _ = std.posix.system.clock_gettime(std.posix.CLOCK.MONOTONIC, &ts);
+    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), std.time.ns_per_ms);
+}
+
+fn sleepMs(ms: u64) void {
+    const req = std.posix.timespec{
+        .sec = @intCast(@divTrunc(ms, 1000)),
+        .nsec = @intCast(@rem(ms, 1000) * std.time.ns_per_ms),
+    };
+    _ = std.posix.system.nanosleep(&req, null);
+}
+
 // ---- net integration: glue MinerState to net.Hooks ----
 const Ctx = struct {
     s: *state.MinerState,
@@ -69,11 +85,14 @@ fn installSignalHandler() void {
         _ = std.os.windows.kernel32.SetConsoleCtrlHandler(ctrlHandler, std.os.windows.TRUE);
     } else {
         const handler = struct {
-            fn h(_: c_int) callconv(.C) void {
+            fn h(_: std.posix.SIG) callconv(.c) void {
                 G.quit.store(true, .monotonic);
             }
         }.h;
-        const act = std.posix.Sigaction{ .handler = .{ .handler = handler }, .mask = std.posix.empty_sigset, .flags = 0 };
+        // std.posix.empty_sigset was removed in 0.16. `sigset_t` is a small fixed-size
+        // array; an all-zero bit pattern is the empty set per POSIX.
+        const empty_mask: std.posix.system.sigset_t = std.mem.zeroes(std.posix.system.sigset_t);
+        const act = std.posix.Sigaction{ .handler = .{ .handler = handler }, .mask = empty_mask, .flags = 0 };
         std.posix.sigaction(std.posix.SIG.INT, &act, null);
         std.posix.sigaction(std.posix.SIG.TERM, &act, null);
     }
@@ -106,7 +125,7 @@ fn powKat(alloc: std.mem.Allocator, hex_out: *[64]u8) !bool {
     defer w.deinitSA();
     var out: [32]u8 = undefined;
     try pow.hash("a", &out, w);
-    _ = std.fmt.bufPrint(hex_out, "{s}", .{std.fmt.fmtSliceHexLower(&out)}) catch unreachable;
+    _ = std.fmt.bufPrint(hex_out, "{s}", .{std.fmt.bytesToHex(&out, .lower)}) catch unreachable;
     const expected = "54e2324ddacc3f0383501a9e5760f85d63e9bc6705e9124ca7aef89016ab81ea";
     return std.mem.eql(u8, hex_out, expected);
 }
@@ -189,11 +208,12 @@ fn formatStatusLineChecked(buf: []u8, stats: ReportStats) ![]const u8 {
 
 fn reporter() void {
     var prev: i64 = 0;
-    const t0 = std.time.milliTimestamp();
+    const t0 = nowMsMonotonic();
     var prev_t = t0;
+
     while (!G.quit.load(.monotonic)) {
-        std.time.sleep(std.time.ns_per_s);
-        const now = std.time.milliTimestamp();
+        sleepMs(1000);
+        const now = nowMsMonotonic();
         const dt = @as(f64, @floatFromInt(now - prev_t)) / 1000.0;
         const elapsed = @as(f64, @floatFromInt(now - t0)) / 1000.0;
         prev_t = now;
@@ -306,17 +326,35 @@ fn setDaemon(hp_in: []const u8) void {
 }
 
 /// Absolute path to config.json next to the running executable, or null if unresolved.
-fn exeConfigPath(alloc: std.mem.Allocator) ?[]u8 {
-    const dir = std.fs.selfExeDirPathAlloc(alloc) catch return null;
-    defer alloc.free(dir);
+/// std.fs.selfExeDirPathAlloc was removed in 0.16; resolve via readlink(/proc/self/exe)
+/// on Linux, _NSGetExecutablePath on macOS, GetModuleFileNameW on Windows. We only
+/// port the Linux path here (the miner is Linux/Windows primary; macOS is bonus).
+fn exeConfigPath(io: std.Io, alloc: std.mem.Allocator) ?[]u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const n = std.Io.Dir.readLinkAbsolute(io, "/proc/self/exe", &buf) catch return null;
+    const full = buf[0..n];
+    const slash = std.mem.lastIndexOfScalar(u8, full, '/') orelse return null;
+    const dir = full[0..slash];
     return std.fs.path.join(alloc, &.{ dir, "config.json" }) catch null;
 }
 
 /// Read one trimmed line from stdin; null on empty/EOF (caller keeps the current value).
+/// std.io.getStdIn().reader().readUntilDelimiterOrEof was removed in 0.16; do a direct
+/// libc read(2) loop on stdin -- enough for the --setup interactive prompts.
 fn promptLine(buf: []u8) ?[]const u8 {
-    const line = std.io.getStdIn().reader().readUntilDelimiterOrEof(buf, '\n') catch return null;
-    const l = line orelse return null;
-    const t = std.mem.trim(u8, l, " \t\r\n");
+    var pos: usize = 0;
+    while (pos + 1 < buf.len) {
+        const n = std.posix.read(std.posix.STDIN_FILENO, buf[pos .. pos + 1]) catch return null;
+        if (n == 0) {
+            if (pos == 0) return null;
+            break;
+        }
+        if (buf[pos] == '\n') break;
+        pos += 1;
+    }
+    buf[pos] = 0;
+    const slice = buf[0..pos];
+    const t = std.mem.trim(u8, slice, " \t\r\n");
     return if (t.len == 0) null else t;
 }
 
@@ -324,13 +362,19 @@ fn promptLine(buf: []u8) ?[]const u8 {
 /// defaults; CLI flags parsed afterwards override these. Returns true if the file was
 /// read+parsed. `cfg_threads` receives the raw threads value (for --setup's display).
 /// A missing/invalid file is non-fatal (returns false).
-fn loadConfig(alloc: std.mem.Allocator, path: []const u8, nthreads: *usize, cfg_threads: *i64) bool {
+fn loadConfig(io: std.Io, alloc: std.mem.Allocator, path: []const u8, nthreads: *usize, cfg_threads: *i64) bool {
+    const cwd = std.Io.Dir.cwd();
+    // 0.16 has no `Dir.readFileAbsolute`; open + readAll via Io.Reader interface.
     const file = (if (std.fs.path.isAbsolute(path))
-        std.fs.openFileAbsolute(path, .{})
+        std.Io.Dir.openFileAbsolute(io, path, .{})
     else
-        std.fs.cwd().openFile(path, .{})) catch return false;
-    defer file.close();
-    const bytes = file.readToEndAlloc(alloc, 64 * 1024) catch return false;
+        cwd.openFile(io, path, .{})) catch return false;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var reader = file.reader(io, &rbuf);
+    // Io.Reader.readAlloc allocates exactly `len` bytes and reads into them; we cap at
+    // the historical 64 KiB so a runaway config file is rejected.
+    const bytes = reader.interface.readAlloc(alloc, 64 * 1024) catch return false;
     defer alloc.free(bytes);
     const c = config.parseConfig(alloc, bytes) catch |e| {
         std.debug.print("warning: could not parse {s}: {s}\n", .{ path, @errorName(e) });
@@ -342,18 +386,27 @@ fn loadConfig(alloc: std.mem.Allocator, path: []const u8, nthreads: *usize, cfg_
         cfg_threads.* = t;
         if (t > 0) nthreads.* = @intCast(t);
     }
-    // Silent on success to match the C miner's display (it prints nothing before the
-    // banner). The no-config / parse-error diagnostics above remain for misconfiguration.
     return true;
 }
 
-pub fn main() !u8 {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !u8 {
+    const alloc = init.gpa;
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    var args_list: std.ArrayList([]const u8) = .empty;
+    defer args_list.deinit(alloc);
+
+    var arg_it = std.process.Args.Iterator.init(init.minimal.args);
+    defer arg_it.deinit();
+    var first = true;
+    while (arg_it.next()) |arg| {
+        if (first) {
+            first = false;
+            continue; // skip argv[0]
+        }
+        try args_list.append(alloc, arg);
+    }
+    const args = try args_list.toOwnedSlice(alloc);
+    defer alloc.free(args);
 
     var do_selftest = false;
     var do_setup = false;
@@ -376,13 +429,13 @@ pub fn main() !u8 {
     {
         var loaded = false;
         if (explicit_cfg) |p| {
-            loaded = loadConfig(alloc, p, &nthreads, &cfg_threads);
+            loaded = loadConfig(init.io, alloc, p, &nthreads, &cfg_threads);
         } else {
-            if (exeConfigPath(alloc)) |ep| {
+            if (exeConfigPath(init.io, alloc)) |ep| {
                 defer alloc.free(ep);
-                loaded = loadConfig(alloc, ep, &nthreads, &cfg_threads);
+                loaded = loadConfig(init.io, alloc, ep, &nthreads, &cfg_threads);
             }
-            if (!loaded) loaded = loadConfig(alloc, "config.json", &nthreads, &cfg_threads);
+            if (!loaded) loaded = loadConfig(init.io, alloc, "config.json", &nthreads, &cfg_threads);
         }
         if (!loaded) std.debug.print("config : no config.json found (next to the exe or in the working dir) -- using built-in defaults\n", .{});
     }
@@ -440,18 +493,19 @@ pub fn main() !u8 {
         var wpath_owned: ?[]u8 = null;
         defer if (wpath_owned) |p| alloc.free(p);
         const wpath: []const u8 = if (explicit_cfg) |p| p else blk: {
-            wpath_owned = exeConfigPath(alloc);
+            wpath_owned = exeConfigPath(init.io, alloc);
             break :blk (wpath_owned orelse "config.json");
         };
         const f = (if (std.fs.path.isAbsolute(wpath))
-            std.fs.createFileAbsolute(wpath, .{})
+            std.Io.Dir.createFileAbsolute(init.io, wpath, .{})
         else
-            std.fs.cwd().createFile(wpath, .{})) catch |e| {
+            std.Io.Dir.cwd().createFile(init.io, wpath, .{})) catch |e| {
             std.debug.print("error: could not write {s}: {s}\n", .{ wpath, @errorName(e) });
             return 1;
         };
-        defer f.close();
-        config.writeConfig(f.writer(), daemon, wallet, threads) catch |e| {
+        defer f.close(init.io);
+        var wbuf: [4096]u8 = undefined;
+        config.writeConfig(f.writer(init.io, &wbuf), daemon, wallet, threads) catch |e| {
             std.debug.print("error: writing config: {s}\n", .{@errorName(e)});
             return 1;
         };
