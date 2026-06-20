@@ -11,6 +11,14 @@ const BLOB_LEN = state.BLOB_LEN;
 pub const NONCE_OFFSET = 43; // bytes 43..46, big-endian
 pub const THREAD_ID_OFFSET = 47;
 
+fn sleepMs(ms: u64) void {
+    const req = std.posix.timespec{
+        .sec = @intCast(@divTrunc(ms, 1000)),
+        .nsec = @intCast(@rem(ms, 1000) * std.time.ns_per_ms),
+    };
+    _ = std.posix.system.nanosleep(&req, null);
+}
+
 fn toHex(bytes: []const u8, out: []u8) void {
     const h = "0123456789abcdef";
     for (bytes, 0..) |b, i| {
@@ -55,7 +63,7 @@ pub fn mineThread(s: *MinerState, tid: usize, w0: *pow.Worker, w1: *pow.Worker) 
     while (!s.quit.load(.monotonic)) {
         if (s.connected.load(.monotonic) and
             s.job_epoch.load(.acquire) > 0) break;
-        std.time.sleep(50 * std.time.ns_per_ms);
+        sleepMs(50);
     }
 
     outer: while (!s.quit.load(.monotonic)) {

@@ -2,9 +2,27 @@
 //!   bench [threads] [seconds]
 const std = @import("std");
 const builtin = @import("builtin");
+const posix = std.posix;
 const pow = @import("pow.zig");
 const system = @import("system.zig");
 const pages = @import("pages.zig");
+
+// `std.time.milliTimestamp`/`std.time.sleep` were removed in Zig 0.16. Use
+// clock_gettime(CLOCK_MONOTONIC) + nanosleep directly via libc (we already link
+// libc for the SA objects).
+fn nowMs() i128 {
+    var ts: posix.timespec = undefined;
+    _ = posix.system.clock_gettime(posix.CLOCK.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * 1000 + @divTrunc(@as(i128, ts.nsec), std.time.ns_per_ms);
+}
+
+fn sleepMs(ms: u64) void {
+    const req = posix.timespec{
+        .sec = @intCast(@divTrunc(ms, 1000)),
+        .nsec = @intCast(@rem(ms, 1000) * std.time.ns_per_ms),
+    };
+    _ = posix.system.nanosleep(&req, null);
+}
 
 const Ctx = struct {
     count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
@@ -69,10 +87,24 @@ fn worker(ctx: *Ctx, tid: usize) void {
     _ = ctx.count.fetchAdd(local & 31, .monotonic);
 }
 
-pub fn main() !void {
-    const a = std.heap.page_allocator;
-    const args = try std.process.argsAlloc(a);
-    defer std.process.argsFree(a, args);
+pub fn main(init: std.process.Init) !void {
+    const a = init.gpa;
+
+    var args_list: std.ArrayList([]const u8) = .empty;
+    defer args_list.deinit(a);
+
+    var arg_it = std.process.Args.Iterator.init(init.minimal.args);
+    defer arg_it.deinit();
+    var first = true;
+    while (arg_it.next()) |arg| {
+        if (first) {
+            first = false;
+            continue; // skip argv[0]
+        }
+        try args_list.append(a, arg);
+    }
+    const args = try args_list.toOwnedSlice(a);
+    defer a.free(args);
     const nthreads = if (args.len > 1) try std.fmt.parseInt(usize, args[1], 10) else (std.Thread.getCpuCount() catch 4);
     const secs = if (args.len > 2) try std.fmt.parseInt(u64, args[2], 10) else 10;
     const aff = if (args.len > 3) (args[3][0] != '0' or args[3].len > 1) else false;
@@ -93,13 +125,13 @@ pub fn main() !void {
     const threads = try a.alloc(std.Thread, nthreads);
     defer a.free(threads);
 
-    const t0 = std.time.milliTimestamp();
+    const t0 = nowMs();
     for (threads, 0..) |*t, i| t.* = try std.Thread.spawn(.{}, worker, .{ &ctx, i });
-    std.time.sleep(secs * std.time.ns_per_s);
+    sleepMs(secs * 1000);
     ctx.stop.store(true, .monotonic);
     for (threads) |t| t.join();
 
-    const dt = @as(f64, @floatFromInt(std.time.milliTimestamp() - t0)) / 1000.0;
+    const dt = @as(f64, @floatFromInt(nowMs() - t0)) / 1000.0;
     const total = ctx.count.load(.monotonic);
     const khs = @as(f64, @floatFromInt(total)) / dt / 1000.0;
     std.debug.print("bench: {d} threads, {d:.1}s, {d} hashes -> {d:.2} KH/s total ({d:.3} KH/s/thread)\n", .{ nthreads, dt, total, khs, khs / @as(f64, @floatFromInt(nthreads)) });
