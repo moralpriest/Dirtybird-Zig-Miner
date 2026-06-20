@@ -8,6 +8,20 @@ pub const SUBMIT_RING = 8; // submit mailbox depth: enough to never drop a found
 
 const Atomic = std.atomic.Value;
 
+// std.Thread.Mutex was removed in Zig 0.16. Wrap a pthread_mutex_t in a tiny
+// helper with the same .lock()/.unlock() surface so the rest of this file
+// doesn't have to thread an Io around every critical section.
+const Mutex = struct {
+    inner: std.c.pthread_mutex_t = std.c.PTHREAD_MUTEX_INITIALIZER,
+
+    pub fn lock(self: *Mutex) void {
+        _ = std.c.pthread_mutex_lock(&self.inner);
+    }
+    pub fn unlock(self: *Mutex) void {
+        _ = std.c.pthread_mutex_unlock(&self.inner);
+    }
+};
+
 /// One staged submission (a found miniblock awaiting send).
 const SubmitEntry = struct {
     jobid: [MAX_JOBID]u8 = undefined,
@@ -18,7 +32,7 @@ const SubmitEntry = struct {
 
 pub const MinerState = struct {
     // ---- job (blob/jobid/height under job_mutex; difficulty/epoch atomic) ----
-    job_mutex: std.Thread.Mutex = .{},
+    job_mutex: Mutex = .{},
     blob: [BLOB_LEN]u8 = [_]u8{0} ** BLOB_LEN,
     jobid_buf: [MAX_JOBID]u8 = undefined,
     jobid_len: usize = 0,
@@ -32,7 +46,7 @@ pub const MinerState = struct {
     // ---- submit mailbox: small FIFO ring so concurrent hits are never dropped ----
     // The reference C spin-waits to deposit a single in-flight share; an 8-entry ring
     // gives the same "never drop a found miniblock" without blocking the miner thread.
-    submit_mutex: std.Thread.Mutex = .{},
+    submit_mutex: Mutex = .{},
     submit_ready: Atomic(bool) = Atomic(bool).init(false), // ring non-empty (lock-free hint)
     submit_ring: [SUBMIT_RING]SubmitEntry = undefined,
     submit_head: usize = 0, // index of next entry to pop
