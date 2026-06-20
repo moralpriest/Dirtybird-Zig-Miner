@@ -26,7 +26,13 @@ fn addSaDeps(m: *std.Build.Module, b: *std.Build, pgo: []const u8, profile_rt: ?
         // Instrumentation needs your Clang profile runtime (libclang_rt.profile-*).
         // Provide it with -Dprofile_rt=<path>, e.g. the one shipped by your LLVM/MinGW.
         if (profile_rt) |p| {
-            m.addObjectFile(b.path(p));
+            // std.Build.addObjectFile/LazyPath doesn't accept absolute paths via simple
+            // `b.path`. `cwd_relative` is the documented escape hatch.
+            if (std.fs.path.isAbsolute(p)) {
+                m.addObjectFile(.{ .cwd_relative = p });
+            } else {
+                m.addObjectFile(b.path(p));
+            }
         } else {
             std.debug.print(
                 "build: -Dpgo=gen requires -Dprofile_rt=<path to libclang_rt.profile-x86_64.a>\n",
