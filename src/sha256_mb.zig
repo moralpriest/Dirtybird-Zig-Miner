@@ -319,7 +319,7 @@ fn compress1(state: *State, base: [*]const u8, nblocks: usize) void {
         : [st] "r" (state),
           [k] "r" (&W),
           [mask] "r" (&SHUF_MASK),
-        : "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "memory", "cc"
+        : .{ .xmm0 = true, .xmm1 = true, .xmm2 = true, .xmm3 = true, .xmm4 = true, .xmm5 = true, .xmm6 = true, .xmm7 = true, .xmm8 = true, .xmm9 = true, .xmm10 = true, .memory = true, .cc = true }
     );
 }
 
@@ -771,7 +771,7 @@ fn compress2(st0: *State, st1: *State, base0: [*]const u8, base1: [*]const u8, n
           [k] "r" (&W),
           [mask] "r" (&SHUF_MASK),
           [sv] "r" (&save),
-        : "xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7", "xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15", "memory", "cc"
+        : .{ .xmm0 = true, .xmm1 = true, .xmm2 = true, .xmm3 = true, .xmm4 = true, .xmm5 = true, .xmm6 = true, .xmm7 = true, .xmm8 = true, .xmm9 = true, .xmm10 = true, .xmm11 = true, .xmm12 = true, .xmm13 = true, .xmm14 = true, .xmm15 = true, .memory = true, .cc = true }
     );
 }
 
