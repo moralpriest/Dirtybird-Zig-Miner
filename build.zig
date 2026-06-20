@@ -9,20 +9,24 @@ const builtin = @import("builtin");
 // The suffix array is most of the per-hash cost, so these are built with the
 // reference's release flags (-DNDEBUG drops the libsais/v114 asserts from the hot
 // path). -Dpgo=gen|use enables an optional two-pass profile-guided build.
-fn addSaDeps(c: *std.Build.Step.Compile, b: *std.Build, pgo: []const u8, profile_rt: ?[]const u8) void {
-    var cf = std.ArrayList([]const u8).init(b.allocator);
-    var cppf = std.ArrayList([]const u8).init(b.allocator);
-    cf.appendSlice(&.{ "-O3", "-DNDEBUG", "-fomit-frame-pointer", "-finline-functions", "-fno-sanitize=all" }) catch @panic("oom");
-    cppf.appendSlice(&.{ "-O3", "-DNDEBUG", "-fomit-frame-pointer", "-finline-functions", "-fno-vectorize", "-fno-slp-vectorize", "-fno-sanitize=all", "-std=c++17" }) catch @panic("oom");
+fn addSaDeps(m: *std.Build.Module, b: *std.Build, pgo: []const u8, profile_rt: ?[]const u8) void {
+    // SA objects link through libc (libsais, sha_stub.c) and libc++ (v114_*.cpp).
+    m.link_libc = true;
+    m.link_libcpp = true;
+
+    var cf: std.ArrayList([]const u8) = .empty;
+    var cppf: std.ArrayList([]const u8) = .empty;
+    cf.appendSlice(b.allocator, &.{ "-O3", "-DNDEBUG", "-fomit-frame-pointer", "-finline-functions", "-fno-sanitize=all" }) catch @panic("oom");
+    cppf.appendSlice(b.allocator, &.{ "-O3", "-DNDEBUG", "-fomit-frame-pointer", "-finline-functions", "-fno-vectorize", "-fno-slp-vectorize", "-fno-sanitize=all", "-std=c++17" }) catch @panic("oom");
 
     if (std.mem.eql(u8, pgo, "gen")) {
         // Instrumented build: writes profiles to _pgo/ when the binary runs.
-        cf.append("-fprofile-generate=_pgo") catch @panic("oom");
-        cppf.append("-fprofile-generate=_pgo") catch @panic("oom");
+        cf.append(b.allocator, "-fprofile-generate=_pgo") catch @panic("oom");
+        cppf.append(b.allocator, "-fprofile-generate=_pgo") catch @panic("oom");
         // Instrumentation needs your Clang profile runtime (libclang_rt.profile-*).
         // Provide it with -Dprofile_rt=<path>, e.g. the one shipped by your LLVM/MinGW.
         if (profile_rt) |p| {
-            c.addObjectFile(.{ .cwd_relative = p });
+            m.addObjectFile(b.path(p));
         } else {
             std.debug.print(
                 "build: -Dpgo=gen requires -Dprofile_rt=<path to libclang_rt.profile-x86_64.a>\n",
@@ -32,18 +36,16 @@ fn addSaDeps(c: *std.Build.Step.Compile, b: *std.Build, pgo: []const u8, profile
         }
     } else if (std.mem.eql(u8, pgo, "use")) {
         // Fold a previously-merged profile (llvm-profdata merge _pgo/*.profraw) back in.
-        cf.appendSlice(&.{ "-fprofile-use=_pgo/merged.profdata", "-flto" }) catch @panic("oom");
-        cppf.appendSlice(&.{ "-fprofile-use=_pgo/merged.profdata", "-flto" }) catch @panic("oom");
+        cf.appendSlice(b.allocator, &.{ "-fprofile-use=_pgo/merged.profdata", "-flto" }) catch @panic("oom");
+        cppf.appendSlice(b.allocator, &.{ "-fprofile-use=_pgo/merged.profdata", "-flto" }) catch @panic("oom");
     }
 
-    c.addCSourceFile(.{ .file = b.path("vendor/libsais/libsais.c"), .flags = cf.items });
-    c.addCSourceFile(.{ .file = b.path("vendor/v114/sha_stub.c"), .flags = cf.items });
-    c.addCSourceFile(.{ .file = b.path("vendor/v114/v114_stubs.cpp"), .flags = cppf.items });
-    c.addCSourceFile(.{ .file = b.path("vendor/v114/v114_wrapper.cpp"), .flags = cppf.items });
-    c.addIncludePath(b.path("vendor/libsais"));
-    c.addIncludePath(b.path("vendor/v114"));
-    c.linkLibC();
-    c.linkLibCpp();
+    m.addCSourceFile(.{ .file = b.path("vendor/libsais/libsais.c"), .flags = cf.items });
+    m.addCSourceFile(.{ .file = b.path("vendor/v114/sha_stub.c"), .flags = cf.items });
+    m.addCSourceFile(.{ .file = b.path("vendor/v114/v114_stubs.cpp"), .flags = cppf.items });
+    m.addCSourceFile(.{ .file = b.path("vendor/v114/v114_wrapper.cpp"), .flags = cppf.items });
+    m.addIncludePath(b.path("vendor/libsais"));
+    m.addIncludePath(b.path("vendor/v114"));
 }
 
 pub fn build(b: *std.Build) void {
@@ -70,20 +72,23 @@ pub fn build(b: *std.Build) void {
     var pgo = pgo_opt;
     if (std.mem.eql(u8, pgo_opt, "use")) {
         const have_profile = blk: {
-            b.build_root.handle.access("_pgo/merged.profdata", .{}) catch break :blk false;
+            b.build_root.handle.access(b.graph.io, "_pgo/merged.profdata", .{}) catch break :blk false;
             break :blk true;
         };
         if (!(have_profile and target.result.cpu.arch == .x86_64)) pgo = "off";
     }
     std.debug.print("build: optimize={s} cpu={s} pgo={s}\n", .{ @tagName(optimize), target.result.cpu.model.name, pgo });
 
-    const exe = b.addExecutable(.{
-        .name = "zig-miner",
+    const exe_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
         .optimize = optimize,
     });
-    addSaDeps(exe, b, pgo, profile_rt);
+    const exe = b.addExecutable(.{
+        .name = "zig-miner",
+        .root_module = exe_mod,
+    });
+    addSaDeps(exe_mod, b, pgo, profile_rt);
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);
@@ -94,13 +99,16 @@ pub fn build(b: *std.Build) void {
 
     // ---- synthetic hashrate benchmark (no network; used by the Benchmarks CI).
     // Usage: zig build bench -- <threads> <seconds> <aff 0/1> <affmode>
-    const bench = b.addExecutable(.{
-        .name = "bench",
+    const bench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench.zig"),
         .target = target,
         .optimize = optimize,
     });
-    addSaDeps(bench, b, pgo, profile_rt);
+    const bench = b.addExecutable(.{
+        .name = "bench",
+        .root_module = bench_mod,
+    });
+    addSaDeps(bench_mod, b, pgo, profile_rt);
     b.installArtifact(bench);
     const bench_run = b.addRunArtifact(bench);
     if (b.args) |args| bench_run.addArgs(args);
