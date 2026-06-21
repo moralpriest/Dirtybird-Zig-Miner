@@ -46,14 +46,11 @@ const AFF_MAPS = [_][10]u6{
 };
 
 fn worker(ctx: *Ctx, tid: usize) void {
-    // Affinity / priority / large-page helpers are Windows-only; comptime-guard so
-    // the bench cross-compiles and runs (unpinned) on Linux/macOS too.
-    if (comptime builtin.os.tag == .windows) {
-        if (ctx.aff) {
-            const cpu: u6 = if (ctx.nthreads == 10) AFF_MAPS[ctx.affmode][tid] else system.recommendedAffinityForThreads(ctx.nthreads)[tid];
-            system.pinThreadToLogical(cpu);
-            system.setThreadHighPriority();
-        }
+    // Affinity helpers are Windows + Linux now; macOS still no-op. Pinned
+    // workers give the SA + SHA hot path private L1/L2 per thread.
+    if (ctx.aff and (builtin.os.tag == .windows or builtin.os.tag == .linux)) {
+        const cpu: u6 = if (ctx.nthreads == 10) AFF_MAPS[ctx.affmode][tid] else system.recommendedAffinityForThreads(ctx.nthreads)[tid];
+        system.pinThreadToLogical(cpu);
     }
     var large_backing: ?pages.PageBacking = null;
     const w: *pow.Worker = blk: {

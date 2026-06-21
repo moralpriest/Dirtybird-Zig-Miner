@@ -14,6 +14,7 @@
 //! When built via build.zig, kernel32 and advapi32 are pulled in automatically.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const windows = std.os.windows;
 
 // ── Win32 base types ─────────────────────────────────────────────────────────
@@ -218,8 +219,24 @@ pub fn setProcessHighPriority() void {
 }
 
 pub fn pinThreadToLogical(cpu: u6) void {
-    const mask: ULONG_PTR = @as(ULONG_PTR, 1) << cpu;
-    _ = SetThreadAffinityMask(GetCurrentThread(), mask);
+    if (builtin.os.tag == .windows) {
+        const mask: ULONG_PTR = @as(ULONG_PTR, 1) << cpu;
+        _ = SetThreadAffinityMask(GetCurrentThread(), mask);
+        return;
+    }
+    if (builtin.os.tag != .linux) return;
+
+    // Linux — use std.os.linux.sched_setaffinity (raw syscall). cpu_set_t is a
+    // fixed-size array of c_ulong sized by sigset_len (Linux's CPU_SETSIZE
+    // is hard-coded to 1024 historically; glibc mirrors it). Set the bit for
+    // `cpu` directly in the array, then sched_setaffinity self = 0.
+    const SetLen: usize = @typeInfo(std.os.linux.cpu_set_t).array.len;
+    var mask: std.os.linux.cpu_set_t = std.mem.zeroes(std.os.linux.cpu_set_t);
+    const u: usize = @intCast(cpu);
+    const word_idx: usize = u / @bitSizeOf(c_ulong);
+    const bit_off: u6 = @intCast(u % @bitSizeOf(c_ulong));
+    if (word_idx < SetLen) mask[word_idx] = (@as(c_ulong, 1)) << @intCast(bit_off);
+    std.os.linux.sched_setaffinity(0, &mask) catch {};
 }
 
 // ── 4. setThreadHighPriority ──────────────────────────────────────────────────
@@ -273,23 +290,35 @@ pub fn enableVirtualTerminal() void {
 /// Ordering rationale (AstroBWTv3 is memory/cache-heavy: suffix-array build,
 /// RC4 in-place, 278-iter branch loop with CodeLUT):
 ///
-///   1. P-core distinct physicals first (even logicals 0,2,4,6,8,10,12,14):
-///      each occupies its own physical core → no L1/L2 sharing = full cache per thread.
-///   2. E-cores (16..23): have their own L2 but smaller; still beat HT siblings.
-///   3. P-core HT siblings (odd logicals 1,3,5,7,9,11,13,15): share L1/L2 with
-///      the already-scheduled partner; worst cache locality for this workload.
+///   1. Distinct physical cores first — one CPU per core, never two threads
+///      sharing an L1/L2. Each CPU is the "first HT sibling" (comptime-pinned
+///      even-halves on Intel where Linux numbers SMT pairs as (0,1) (2,3) …;
+///      or the lowest-numbered logical within the siblings set on whatever the
+///      kernel chose). Cycle through distinct physicals before adding any
+///      second-thread siblings, so the per-thread cache footprint stays
+///      independent.
+///   2. HT siblings (comptime siblings of #1) — share L1/L2 with the
+///      already-scheduled partner. Worst cache locality for this workload,
+///      placed last so a small thread count avoids them.
 ///
-/// For 10 threads on i7-13700HX our recommendation is:
-///   logical [0,2,4,6,8,10,12,14,16,17] — 8 distinct P-cores + 2 E-cores.
-/// This gives 10 independent cache domains (8 P-core L2s + shared E-cluster L2).
-/// Prefer this over 8P+2HT-siblings because sibling pairs share 2MB L2 and will
-/// thrash each other on the 278-iter CodeLUT loop (~5KB hot data per thread).
-///
-/// The lead should A/B test this against all-E-core-excluded and all-HT configs.
+/// Linux: probe `/sys/devices/system/cpu/cpu<N>/topology/thread_siblings_list`
+/// in each cpu<N>'s siblings file; group by sibling set; pick the smallest
+/// member of each group (in CI / arithmetic tests that picker also gives us
+/// repeatability).
+/// Windows + non-Linux + fallback on probe failure: use the original
+/// i7-13700HX-shaped order below — preserves the prior behavior on those hosts.
 ///
 /// Returns up to 24 entries; entries beyond n are 0-filled.
 pub fn recommendedAffinityForThreads(n: usize) [24]u6 {
-    // Ordered preference: distinct P-core physicals, then E-cores, then HT siblings.
+    // Probe on Linux, fall back to the original i7-shaped order otherwise.
+    if (builtin.os.tag == .linux) {
+        if (probeLinuxTopologyOrder()) |probed| {
+            return orderFromProbed(probed, n);
+        }
+    }
+
+    // i7-13700HX-shaped default (8 P + 8 E + 8 P-HT siblings). Preserves the
+    // pre-Stage-2 behavior on Windows / non-Linux / --probe failures.
     const order = [24]u6{
         // 8 distinct P-core physical cores (even logicals = first HT sibling)
         0,  2,  4,  6,  8,  10, 12, 14,
@@ -303,6 +332,156 @@ pub fn recommendedAffinityForThreads(n: usize) [24]u6 {
     const count = @min(n, 24);
     for (0..count) |i| {
         result[i] = order[i];
+    }
+    return result;
+}
+
+/// Parsed-topology ordering record. Each entry: a "first representative"
+/// member of a thread-siblings group, followed by the *other* member(s) of
+/// that group (i.e., HT siblings). Groups are visited in the order their
+/// first-representative was discovered in /sys (typically ascending logical
+/// IDs on x86_64 Linux).
+const ProbedTopology = struct {
+    /// Representative-of-group IDs in the order they were encountered. With
+    /// SMT-2 + 2 groups per pair, this is the n/2 distinct physical cores.
+    reps: [16]u6,
+    rep_count: u6,
+
+    /// The HT sibling of each rep_group[i]. Only filled when the group has 2
+    /// members (SMT-2). Position-aligned with reps[]. Index i holds the sibling
+    /// of reps[i]; 0 means "no sibling" (SMT disabled or single-thread core).
+    siblings: [16]u6,
+};
+
+/// Probe `/sys/devices/system/cpu/cpu<N>/topology/thread_siblings_list` for
+/// each logical CPU 0..nproc and group by sibling set. Returns null on any
+/// open/read/parse failure (caller falls back to the i7-shaped order).
+fn probeLinuxTopologyOrder() ?ProbedTopology {
+    const allocator = std.heap.page_allocator;
+
+    // Track which sibling groups we've already seen (by first-representative ID).
+    var seen_first: [64]u6 = undefined;
+    var seen_count: u6 = 0;
+
+    var probed: ProbedTopology = .{
+        .reps = .{0} ** 16,
+        .rep_count = 0,
+        .siblings = .{0} ** 16,
+    };
+
+    var cpu: usize = 0;
+    while (cpu < 64) : (cpu += 1) {
+        var path_buf: [256]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "/sys/devices/system/cpu/cpu{d}/topology/thread_siblings_list", .{cpu}) catch continue;
+        const fd = std.posix.openat(std.posix.AT.FDCWD, path, .{ .ACCMODE = .RDONLY }, 0) catch continue;
+        defer _ = std.os.linux.close(fd);
+
+        const buf = allocator.alloc(u8, 256) catch continue;
+        defer allocator.free(buf);
+
+        var total: usize = 0;
+        var attempts: u8 = 0;
+        while (total < buf.len - 1 and attempts < 4) : (attempts += 1) {
+            const r = std.posix.read(fd, buf[total..buf.len - 1]) catch continue;
+            if (r == 0) break;
+            total += r;
+        }
+        const n = total;
+        // Format on Linux/cgroup is "0,2\n" or "0-7\n" or "0,2,4\n" etc.
+        // Returned contents NOT NUL-terminated by readAll.
+        const slice = buf[0..@min(n, buf.len)];
+
+        // Pick the smallest member (id) of the listed group → "representative".
+        var group: [64]u6 = undefined;
+        var group_n: usize = 0;
+        var it = std.mem.splitScalar(u8, slice, ',');
+        while (it.next()) |tok_raw| {
+            const tok = std.mem.trim(u8, tok_raw, " \t\r\n");
+            if (tok.len == 0) continue;
+            // Handle "a-b" ranges.
+            if (std.mem.indexOfScalar(u8, tok, '-')) |dash| {
+                const lo = std.fmt.parseInt(u6, tok[0..dash], 10) catch continue;
+                const hi = std.fmt.parseInt(u6, tok[dash + 1 ..], 10) catch continue;
+                var k: u6 = lo;
+                while (k <= hi) : (k += 1) {
+                    if (group_n >= group.len) break;
+                    group[group_n] = k;
+                    group_n += 1;
+                }
+            } else {
+                const v = std.fmt.parseInt(u6, tok, 10) catch continue;
+                if (group_n >= group.len) continue;
+                group[group_n] = v;
+                group_n += 1;
+            }
+        }
+        if (group_n == 0) continue;
+
+        // Find the smallest member as "representative", and pick its top
+        // sibling if there are ≥2 members.
+        var rep: u6 = group[0];
+        var k: usize = 1;
+        while (k < group_n) : (k += 1) {
+            if (group[k] < rep) rep = group[k];
+        }
+
+        // Skip already-seen groups.
+        var already_seen = false;
+        for (seen_first[0..seen_count]) |s| {
+            if (s == rep) {
+                already_seen = true;
+                break;
+            }
+        }
+        if (already_seen) continue;
+        seen_first[seen_count] = rep;
+        seen_count += 1;
+
+        if (probed.rep_count >= probed.reps.len) break;
+        probed.reps[probed.rep_count] = rep;
+        probed.siblings[probed.rep_count] = if (group_n >= 2) blk: {
+            // Pick the LARGEST member as the heavy-sharing HT sibling (most
+            // kernels expose the second HT as the bigger logical ID).
+            var m: u6 = group[1];
+            var ki: usize = 2;
+            while (ki < group_n) : (ki += 1) {
+                if (group[ki] > m) m = group[ki];
+            }
+            break :blk m;
+        } else 0;
+        probed.rep_count += 1;
+
+        // Stop once we have enough reps to cover downstream n requests.
+        // The order array caps at 24 (16 reps + 16 sibs -> up to 32 IDs).
+        if (probed.rep_count >= 16) break;
+    }
+    if (probed.rep_count == 0) return null;
+    return probed;
+}
+
+/// Convert the probed topology into the [24]u6 first rep-only (always
+/// distinct physical cores), then HT siblings. Capping mutates `n` from the
+/// caller so we don't overflow distinct cores before adding sibs.
+fn orderFromProbed(probed: ProbedTopology, n: usize) [24]u6 {
+    var result = [_]u6{0} ** 24;
+    var out: usize = 0;
+
+    // First pass: emit distinct physical cores (reps) only.
+    var i: usize = 0;
+    while (i < probed.rep_count) : (i += 1) {
+        if (out >= n or out >= result.len) break;
+        result[out] = probed.reps[i];
+        out += 1;
+    }
+
+    // Second pass: HT siblings of each rep. Only meaningful when n > rep_count
+    // AND the rep had a sibling (SMT > 1). Fills the remaining slots.
+    i = 0;
+    while (i < probed.rep_count) : (i += 1) {
+        if (out >= n or out >= result.len) break;
+        if (probed.siblings[i] == 0) continue;
+        result[out] = probed.siblings[i];
+        out += 1;
     }
     return result;
 }
@@ -321,14 +500,31 @@ test "roundUp" {
 }
 
 test "recommendedAffinityForThreads ordering" {
+    if (builtin.os.tag == .linux) {
+        // Zen 5 + SMT-2 + 16 P-cores + 0 E-cores.
+        // Smallest-member per thread-siblings group on Linux x86_64 = even
+        // logicals 0,2,4,...,30. Probe should yield that.
+        const map = recommendedAffinityForThreads(20);
+        // First get the 16 distinct physical cores. Then siblings of those.
+        try std.testing.expectEqual(@as(u6, 0), map[0]);
+        try std.testing.expectEqual(@as(u6, 2), map[1]);
+        try std.testing.expectEqual(@as(u6, 30), map[15]);
+        // 17th..20th: HT siblings (1, 3, 5, 7) — only emit if the request
+        // exceeds distinct cores.
+        try std.testing.expectEqual(@as(u6, 1), map[16]);
+        try std.testing.expectEqual(@as(u6, 3), map[17]);
+        try std.testing.expectEqual(@as(u6, 5), map[18]);
+        try std.testing.expectEqual(@as(u6, 7), map[19]);
+        // Beyond n should be zero (result is 24-entry)
+        try std.testing.expectEqual(@as(u6, 0), map[20]);
+        return;
+    }
+    // Fallback / Windows / non-Linux path: i7-shaped pre-Stage-2 order.
     const map = recommendedAffinityForThreads(10);
-    // First 8 should be distinct P-core physicals
     try std.testing.expectEqual(@as(u6, 0), map[0]);
     try std.testing.expectEqual(@as(u6, 2), map[1]);
     try std.testing.expectEqual(@as(u6, 14), map[7]);
-    // 9th+10th should be first two E-cores
     try std.testing.expectEqual(@as(u6, 16), map[8]);
     try std.testing.expectEqual(@as(u6, 17), map[9]);
-    // Beyond n should be zero
     try std.testing.expectEqual(@as(u6, 0), map[10]);
 }
