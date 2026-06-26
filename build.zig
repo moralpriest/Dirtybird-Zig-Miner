@@ -93,6 +93,7 @@ pub fn build(b: *std.Build) void {
     const exe = b.addExecutable(.{
         .name = "zig-miner",
         .root_module = exe_mod,
+        .pie = true,
     });
     addSaDeps(exe_mod, b, pgo, profile_rt);
     b.installArtifact(exe);
@@ -113,6 +114,7 @@ pub fn build(b: *std.Build) void {
     const bench = b.addExecutable(.{
         .name = "bench",
         .root_module = bench_mod,
+        .pie = true,
     });
     addSaDeps(bench_mod, b, pgo, profile_rt);
     b.installArtifact(bench);
