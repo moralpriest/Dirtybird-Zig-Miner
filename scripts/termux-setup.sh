@@ -35,7 +35,7 @@ fi
 info "Checking dependencies..."
 if [ "$IS_ANDROID" = true ]; then
     pkg update -y >/dev/null 2>&1 || true
-    for cmd in wget tar git xz; do
+    for cmd in wget tar git; do
         if ! command -v "$cmd" &>/dev/null; then
             warn "$cmd not found -- installing..."
             if ! pkg install -y "$cmd" 2>&1; then
@@ -45,6 +45,14 @@ if [ "$IS_ANDROID" = true ]; then
             fi
         fi
     done
+    # xz is provided by the "xz-utils" package in Termux (not "xz")
+    if ! command -v xz &>/dev/null; then
+        warn "xz not found -- installing xz-utils..."
+        if ! pkg install -y xz-utils 2>&1; then
+            pkg update -y >/dev/null 2>&1 || true
+            pkg install -y xz-utils 2>&1 || { err "Failed to install xz-utils. Run manually: pkg install xz-utils"; exit 1; }
+        fi
+    fi
     # Zig is required on Android to build from source (pre-built binary is non-PIE).
     # Termux has no working native Zig package, so download from ziglang.org.
     ZIG_VER="0.16.0"
