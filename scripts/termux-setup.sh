@@ -61,9 +61,22 @@ if [ "$IS_ANDROID" = true ]; then
         if [ ! -d "$ZIG_DIR" ]; then
             warn "zig not found -- downloading Zig ${ZIG_VER} from ziglang.org..."
             mkdir -p "$HOME/.local"
-            wget -q -O "$HOME/.local/zig.tar.xz" "https://ziglang.org/download/${ZIG_VER}/zig-linux-aarch64-${ZIG_VER}.tar.xz"
-            tar -xf "$HOME/.local/zig.tar.xz" -C "$HOME/.local"
+            ZIG_URL="https://ziglang.org/download/${ZIG_VER}/zig-linux-aarch64-${ZIG_VER}.tar.xz"
+            if command -v wget &>/dev/null; then
+                wget --show-progress -O "$HOME/.local/zig.tar.xz" "$ZIG_URL" || \
+                    { err "wget download failed. Check your network connection."; exit 1; }
+            elif command -v curl &>/dev/null; then
+                curl -L --progress-bar -o "$HOME/.local/zig.tar.xz" "$ZIG_URL" || \
+                    { err "curl download failed. Check your network connection."; exit 1; }
+            else
+                err "Neither wget nor curl available. Install one: pkg install wget"
+                exit 1
+            fi
+            info "Extracting Zig..."
+            tar -xf "$HOME/.local/zig.tar.xz" -C "$HOME/.local" || \
+                { err "Extraction failed. The download may be corrupted. Try again."; exit 1; }
             rm -f "$HOME/.local/zig.tar.xz"
+            info "Zig ${ZIG_VER} installed to $ZIG_DIR"
         fi
         export PATH="$ZIG_DIR:$PATH"
     fi
