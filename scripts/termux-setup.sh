@@ -35,50 +35,23 @@ fi
 info "Checking dependencies..."
 if [ "$IS_ANDROID" = true ]; then
     pkg update -y >/dev/null 2>&1 || true
-    for cmd in wget tar git; do
+    # proot-distro is required because Zig's official Linux binary is non-PIE
+    # (e_type ET_EXEC) and Android's linker rejects it.  Running Zig inside a
+    # proot Ubuntu environment avoids this; the output binary is PIE and runs
+    # natively on Termux.
+    for cmd in git proot-distro; do
         if ! command -v "$cmd" &>/dev/null; then
             warn "$cmd not found -- installing..."
             if ! pkg install -y "$cmd" 2>&1; then
-                warn "pkg install $cmd failed -- updating package index and retrying..."
                 pkg update -y >/dev/null 2>&1 || true
-                pkg install -y "$cmd" 2>&1 || { err "Failed to install $cmd. Run manually: pkg install $cmd"; exit 1; }
+                pkg install -y "$cmd" 2>&1 || { err "Failed to install $cmd"; exit 1; }
             fi
         fi
     done
-    # xz is provided by the "xz-utils" package in Termux (not "xz")
-    if ! command -v xz &>/dev/null; then
-        warn "xz not found -- installing xz-utils..."
-        if ! pkg install -y xz-utils 2>&1; then
-            pkg update -y >/dev/null 2>&1 || true
-            pkg install -y xz-utils 2>&1 || { err "Failed to install xz-utils. Run manually: pkg install xz-utils"; exit 1; }
-        fi
-    fi
-    # Zig is required on Android to build from source (pre-built binary is non-PIE).
-    # Termux has no working native Zig package, so download from ziglang.org.
-    ZIG_VER="0.16.0"
-    ZIG_DIR="$HOME/.local/zig-aarch64-linux-${ZIG_VER}"
-    if ! command -v zig &>/dev/null; then
-        if [ ! -d "$ZIG_DIR" ]; then
-            warn "zig not found -- downloading Zig ${ZIG_VER} from ziglang.org..."
-            mkdir -p "$HOME/.local"
-            ZIG_URL="https://ziglang.org/download/${ZIG_VER}/zig-aarch64-linux-${ZIG_VER}.tar.xz"
-            if command -v wget &>/dev/null; then
-                wget --show-progress -O "$HOME/.local/zig.tar.xz" "$ZIG_URL" || \
-                    { err "wget download failed. Check your network connection."; exit 1; }
-            elif command -v curl &>/dev/null; then
-                curl -L --progress-bar -o "$HOME/.local/zig.tar.xz" "$ZIG_URL" || \
-                    { err "curl download failed. Check your network connection."; exit 1; }
-            else
-                err "Neither wget nor curl available. Install one: pkg install wget"
-                exit 1
-            fi
-            info "Extracting Zig..."
-            tar -xf "$HOME/.local/zig.tar.xz" -C "$HOME/.local" || \
-                { err "Extraction failed. The download may be corrupted. Try again."; exit 1; }
-            rm -f "$HOME/.local/zig.tar.xz"
-            info "Zig ${ZIG_VER} installed to $ZIG_DIR"
-        fi
-        export PATH="$ZIG_DIR:$PATH"
+    # Install Ubuntu in proot (one-time, ~200 MB download)
+    if ! proot-distro list 2>/dev/null | grep -q ubuntu; then
+        info "Installing Ubuntu in proot (one-time setup, ~200 MB)..."
+        proot-distro install ubuntu || { err "proot-distro install failed"; exit 1; }
     fi
 else
     for cmd in wget tar; do
@@ -113,15 +86,36 @@ if [ "$IS_ANDROID" = true ]; then
     fi
 
     if [ ! -f "./zig-miner" ]; then
-        info "Building zig-miner from source (PIE-enabled)..."
-        zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl
-        if [ -f "zig-out/bin/zig-miner" ]; then
+        info "Building zig-miner inside proot-Ubuntu (Zig + toolchain)..."
+        ZIG_VER="0.16.0"
+        # Bind-mount $HOME so the repo (already cloned in Termux) is visible
+        # inside proot.  Zig is downloaded/installed inside the Ubuntu rootfs.
+        # The final binary is a static PIE aarch64-linux-musl ELF that runs
+        # natively on Termux without proot.
+        proot-distro login ubuntu --bind "$HOME":/home/builder -- bash -c "
+            set -e
+            apt-get update -qq >/dev/null 2>&1
+            apt-get install -y -qq git wget xz-utils >/dev/null 2>&1
+            ZIG_TARBALL=/tmp/zig-aarch64-linux-${ZIG_VER}.tar.xz
+            ZIG_DIR=/home/builder/.local/zig-aarch64-linux-${ZIG_VER}
+            if [ ! -d \"\$ZIG_DIR\" ]; then
+                mkdir -p /home/builder/.local
+                wget -q -O \"\$ZIG_TARBALL\" \
+                    'https://ziglang.org/download/${ZIG_VER}/zig-aarch64-linux-${ZIG_VER}.tar.xz'
+                tar -xf \"\$ZIG_TARBALL\" -C /home/builder/.local
+                rm -f \"\$ZIG_TARBALL\"
+            fi
+            export PATH=\"\$ZIG_DIR:\$PATH\"
+            cd /home/builder/Dirtybird-Zig-Miner
+            zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl
             cp zig-out/bin/zig-miner ./zig-miner
             chmod +x ./zig-miner
-        else
+        "
+        if [ ! -f "./zig-miner" ]; then
             err "Build failed -- zig-miner not produced."
             exit 1
         fi
+        info "Build successful."
     fi
 else
     # Non-Android: download the latest pre-built release.
