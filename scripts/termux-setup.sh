@@ -34,10 +34,15 @@ fi
 # ── step 1: install deps ──────────────────────────────────────────────────────
 info "Checking dependencies..."
 if [ "$IS_ANDROID" = true ]; then
+    pkg update -y >/dev/null 2>&1 || true
     for cmd in wget tar git xz; do
         if ! command -v "$cmd" &>/dev/null; then
             warn "$cmd not found -- installing..."
-            pkg install -y "$cmd" >/dev/null 2>&1
+            if ! pkg install -y "$cmd" 2>&1; then
+                warn "pkg install $cmd failed -- updating package index and retrying..."
+                pkg update -y >/dev/null 2>&1 || true
+                pkg install -y "$cmd" 2>&1 || { err "Failed to install $cmd. Run manually: pkg install $cmd"; exit 1; }
+            fi
         fi
     done
     # Zig is required on Android to build from source (pre-built binary is non-PIE).
@@ -48,9 +53,9 @@ if [ "$IS_ANDROID" = true ]; then
         if [ ! -d "$ZIG_DIR" ]; then
             warn "zig not found -- downloading Zig ${ZIG_VER} from ziglang.org..."
             mkdir -p "$HOME/.local"
-            wget -q -O /tmp/zig.tar.xz "https://ziglang.org/download/${ZIG_VER}/zig-linux-aarch64-${ZIG_VER}.tar.xz"
-            tar -xf /tmp/zig.tar.xz -C "$HOME/.local"
-            rm -f /tmp/zig.tar.xz
+            wget -q -O "$HOME/.local/zig.tar.xz" "https://ziglang.org/download/${ZIG_VER}/zig-linux-aarch64-${ZIG_VER}.tar.xz"
+            tar -xf "$HOME/.local/zig.tar.xz" -C "$HOME/.local"
+            rm -f "$HOME/.local/zig.tar.xz"
         fi
         export PATH="$ZIG_DIR:$PATH"
     fi
