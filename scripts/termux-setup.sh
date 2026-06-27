@@ -51,7 +51,10 @@ if [ "$IS_ANDROID" = true ]; then
     # Install Ubuntu in proot (one-time, ~200 MB download)
     if ! proot-distro list 2>/dev/null | grep -q ubuntu; then
         info "Installing Ubuntu in proot (one-time setup, ~200 MB)..."
-        proot-distro install ubuntu || { err "proot-distro install failed"; exit 1; }
+        proot-distro install ubuntu 2>/dev/null || {
+            warn "Install failed -- resetting existing Ubuntu container..."
+            proot-distro reset ubuntu 2>/dev/null || { err "proot-distro setup failed"; exit 1; }
+        }
     fi
 else
     for cmd in wget tar; do
