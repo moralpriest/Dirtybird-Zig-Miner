@@ -56,12 +56,12 @@ if [ "$IS_ANDROID" = true ]; then
     # Zig is required on Android to build from source (pre-built binary is non-PIE).
     # Termux has no working native Zig package, so download from ziglang.org.
     ZIG_VER="0.16.0"
-    ZIG_DIR="$HOME/.local/zig-linux-aarch64-${ZIG_VER}"
+    ZIG_DIR="$HOME/.local/zig-aarch64-linux-${ZIG_VER}"
     if ! command -v zig &>/dev/null; then
         if [ ! -d "$ZIG_DIR" ]; then
             warn "zig not found -- downloading Zig ${ZIG_VER} from ziglang.org..."
             mkdir -p "$HOME/.local"
-            ZIG_URL="https://ziglang.org/download/${ZIG_VER}/zig-linux-aarch64-${ZIG_VER}.tar.xz"
+            ZIG_URL="https://ziglang.org/download/${ZIG_VER}/zig-aarch64-linux-${ZIG_VER}.tar.xz"
             if command -v wget &>/dev/null; then
                 wget --show-progress -O "$HOME/.local/zig.tar.xz" "$ZIG_URL" || \
                     { err "wget download failed. Check your network connection."; exit 1; }
