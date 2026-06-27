@@ -106,6 +106,7 @@ if [ "$IS_ANDROID" = true ]; then
             git pull --ff-only 2>/dev/null || true
         else
             info "Cloning repository..."
+            cd "$HOME"
             rm -rf "$INSTALL_DIR"
             git clone -b feat/android-termux-support "https://github.com/$REPO.git" "$INSTALL_DIR"
         fi
