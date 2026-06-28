@@ -11,7 +11,7 @@ const console = @import("console.zig");
 const pages = @import("pages.zig");
 const cpu_features = @import("cpu_features.zig");
 
-const VERSION = "0.1.3";
+const VERSION = "0.2.0";
 
 var G: state.MinerState = .{};
 
