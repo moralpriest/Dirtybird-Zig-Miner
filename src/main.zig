@@ -184,8 +184,7 @@ fn formatStatusLine(buf: []u8, stats: ReportStats) []const u8 {
 
 fn formatStatusLineChecked(buf: []u8, stats: ReportStats) ![]const u8 {
     const rejcol = if (stats.rejected > 0) A_BRED else A_WHITE;
-    var stream = std.io.fixedBufferStream(buf);
-    const writer = stream.writer();
+    var writer = std.Io.Writer.fixed(buf);
 
     try writer.print("\r{s}[DIRTYBIRD] ", .{A_BYELLOW});
     try writer.print("{s}{d:.2} KH/s{s} ({s}{d:.2} KH/s avg{s})", .{
@@ -203,7 +202,7 @@ fn formatStatusLineChecked(buf: []u8, stats: ReportStats) ![]const u8 {
         });
     }
     try writer.print("{s}{s}", .{ A_RESET, A_CLREOL });
-    return stream.getWritten();
+    return buf[0..writer.end];
 }
 
 fn reporter() void {

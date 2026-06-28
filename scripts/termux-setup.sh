@@ -2,9 +2,9 @@
 #
 # Dirtybird Zig Miner -- Termux (Android) setup & launcher.
 #
-# On Android/Termux: installs Zig, clones the repo, and builds from source
-# (required because the pre-built arm64 release is non-PIE, which Android rejects).
-# On other platforms: downloads the latest pre-built release.
+# Downloads the pre-built release for the current platform:
+#   - Android/Termux (aarch64): arm64 static-PIE binary
+#   - Linux (x86_64):           amd64 static binary
 #
 # Prompts for pool/wallet, sets threads to nproc-1 (one core reserved for OS),
 # and auto-restarts on crash. Ctrl-C to stop.
@@ -34,28 +34,12 @@ fi
 # ── step 1: install deps ──────────────────────────────────────────────────────
 info "Checking dependencies..."
 if [ "$IS_ANDROID" = true ]; then
-    pkg update -y >/dev/null 2>&1 || true
-    # proot-distro is required because Zig's official Linux binary is non-PIE
-    # (e_type ET_EXEC) and Android's linker rejects it.  Running Zig inside a
-    # proot Ubuntu environment avoids this; the output binary is PIE and runs
-    # natively on Termux.
-    for cmd in git proot-distro; do
+    for cmd in wget tar; do
         if ! command -v "$cmd" &>/dev/null; then
-            warn "$cmd not found -- installing..."
-            if ! pkg install -y "$cmd" 2>&1; then
-                pkg update -y >/dev/null 2>&1 || true
-                pkg install -y "$cmd" 2>&1 || { err "Failed to install $cmd"; exit 1; }
-            fi
+            pkg update -y >/dev/null 2>&1 || true
+            pkg install -y "$cmd" 2>&1 || { err "Failed to install $cmd"; exit 1; }
         fi
     done
-    # Install Ubuntu in proot (one-time, ~200 MB download)
-    if ! proot-distro list 2>/dev/null | grep -q ubuntu; then
-        info "Installing Ubuntu in proot (one-time setup, ~200 MB)..."
-        proot-distro install ubuntu 2>/dev/null || {
-            warn "Install failed -- resetting existing Ubuntu container..."
-            proot-distro reset ubuntu 2>/dev/null || { err "proot-distro setup failed"; exit 1; }
-        }
-    fi
 else
     for cmd in wget tar; do
         if ! command -v "$cmd" &>/dev/null; then
@@ -66,101 +50,54 @@ else
 fi
 info "Dependencies OK."
 
-# ── step 2: get the source ────────────────────────────────────────────────────
+# ── step 2: get the binary ────────────────────────────────────────────────────
 mkdir -p "$INSTALL_DIR"
 cd "$INSTALL_DIR"
 
-if [ "$IS_ANDROID" = true ]; then
-    # Android: clone or update the repo and build from source.
-    # The pre-built arm64 release is ET_EXEC (non-PIE) which Android rejects,
-    # so we must build with .pie = true.
-    if [ -f "./zig-miner" ] && [ -d "./.git" ]; then
-        info "Existing build found -- skipping clone."
-    else
-        if [ -d "./.git" ]; then
-            info "Updating repository..."
-            git pull --ff-only 2>/dev/null || true
-        else
-            info "Cloning repository..."
-            cd "$HOME"
-            rm -rf "$INSTALL_DIR"
-            git clone -b feat/android-termux-support "https://github.com/$REPO.git" "$INSTALL_DIR"
-        fi
-    fi
-
-    if [ ! -f "./zig-miner" ]; then
-        info "Building zig-miner inside proot-Ubuntu (Zig + toolchain)..."
-        ZIG_VER="0.16.0"
-        # Bind-mount $HOME so the repo (already cloned in Termux) is visible
-        # inside proot.  Zig is downloaded/installed inside the Ubuntu rootfs.
-        # The final binary is a static PIE aarch64-linux-musl ELF that runs
-        # natively on Termux without proot.
-        proot-distro login ubuntu --bind "$HOME":/home/builder -- bash -c "
-            set -e
-            apt-get update -qq >/dev/null 2>&1
-            apt-get install -y -qq git wget xz-utils >/dev/null 2>&1
-            ZIG_TARBALL=/tmp/zig-aarch64-linux-${ZIG_VER}.tar.xz
-            ZIG_DIR=/home/builder/.local/zig-aarch64-linux-${ZIG_VER}
-            if [ ! -d \"\$ZIG_DIR\" ]; then
-                mkdir -p /home/builder/.local
-                wget -q -O \"\$ZIG_TARBALL\" \
-                    'https://ziglang.org/download/${ZIG_VER}/zig-aarch64-linux-${ZIG_VER}.tar.xz'
-                tar -xf \"\$ZIG_TARBALL\" -C /home/builder/.local
-                rm -f \"\$ZIG_TARBALL\"
-            fi
-            export PATH=\"\$ZIG_DIR:\$PATH\"
-            cd /home/builder/Dirtybird-Zig-Miner
-            zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux-musl
-            cp zig-out/bin/zig-miner ./zig-miner
-            chmod +x ./zig-miner
-        "
-        if [ ! -f "./zig-miner" ]; then
-            err "Build failed -- zig-miner not produced."
-            exit 1
-        fi
-        info "Build successful."
-    fi
+if [ -f "./zig-miner" ]; then
+    info "Miner binary already exists -- skipping download."
 else
-    # Non-Android: download the latest pre-built release.
-    if [ -f "./zig-miner" ]; then
-        info "Miner binary already exists -- skipping download."
-    else
-        info "Fetching latest release from GitHub..."
-        LATEST_URL=$(wget -qO- "https://api.github.com/repos/$REPO/releases/latest" \
-            | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
+    info "Fetching latest release from GitHub..."
+    LATEST_TAG=$(wget -qO- "https://api.github.com/repos/$REPO/releases/latest" \
+        | grep '"tag_name"' | head -1 | sed 's/.*"tag_name": *"\([^"]*\)".*/\1/')
 
-        if [ -z "$LATEST_URL" ]; then
-            err "Could not determine latest release. Check your network connection."
-            exit 1
-        fi
-        info "Latest release: $LATEST_URL"
-
-        TARBALL="Dirtybird-Zig-Miner-amd64-${LATEST_URL}.tar.gz"
-        DOWNLOAD_URL="https://github.com/$REPO/releases/download/${LATEST_URL}/${TARBALL}"
-
-        info "Downloading $TARBALL ..."
-        if ! wget -q --show-progress -O "$TARBALL" "$DOWNLOAD_URL"; then
-            err "Download failed."
-            exit 1
-        fi
-
-        info "Extracting..."
-        tar xzf "$TARBALL"
-        rm -f "$TARBALL"
-
-        # move binary to install dir if it's nested in a subdirectory
-        if [ ! -f "./zig-miner" ]; then
-            NESTED=$(find . -maxdepth 2 -name "zig-miner" -type f | head -1)
-            if [ -n "$NESTED" ]; then
-                mv "$NESTED" ./zig-miner
-                rm -rf "$(dirname "$NESTED")" 2>/dev/null || true
-            else
-                err "Extraction succeeded but zig-miner binary not found."
-                exit 1
-            fi
-        fi
-        chmod +x ./zig-miner
+    if [ -z "$LATEST_TAG" ]; then
+        err "Could not determine latest release. Check your network connection."
+        exit 1
     fi
+    info "Latest release: $LATEST_TAG"
+
+    if [ "$IS_ANDROID" = true ]; then
+        ARCH_SUFFIX="arm64"
+    else
+        ARCH_SUFFIX="amd64"
+    fi
+
+    TARBALL="Dirtybird-Zig-Miner-${ARCH_SUFFIX}-${LATEST_TAG}.tar.gz"
+    DOWNLOAD_URL="https://github.com/$REPO/releases/download/${LATEST_TAG}/${TARBALL}"
+
+    info "Downloading $TARBALL ..."
+    if ! wget -q --show-progress -O "$TARBALL" "$DOWNLOAD_URL"; then
+        err "Download failed."
+        exit 1
+    fi
+
+    info "Extracting..."
+    tar xzf "$TARBALL"
+    rm -f "$TARBALL"
+
+    # move binary to install dir if it's nested in a subdirectory
+    if [ ! -f "./zig-miner" ]; then
+        NESTED=$(find . -maxdepth 2 -name "zig-miner" -type f | head -1)
+        if [ -n "$NESTED" ]; then
+            mv "$NESTED" ./zig-miner
+            rm -rf "$(dirname "$NESTED")" 2>/dev/null || true
+        else
+            err "Extraction succeeded but zig-miner binary not found."
+            exit 1
+        fi
+    fi
+    chmod +x ./zig-miner
 fi
 
 # ── step 3: prompt for daemon address ────────────────────────────────────────

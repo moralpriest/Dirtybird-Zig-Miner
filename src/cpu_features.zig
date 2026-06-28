@@ -173,7 +173,7 @@ fn xgetbv0() u32 {
         \\ xgetbv
         : [_] "={eax}" (-> u32),
         :
-        : "edx", "ecx"
+        : .{ .edx = true, .ecx = true }
     );
 }
 

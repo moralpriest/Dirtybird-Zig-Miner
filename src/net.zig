@@ -208,24 +208,25 @@ pub const FrameResult = union(enum) {
 pub const WsFrameParser = struct {
     buf: std.ArrayList(u8), // raw received bytes not yet consumed
     payload: std.ArrayList(u8), // owned copy of the most recent frame's payload
+    gpa: std.mem.Allocator,
 
-    pub fn init(_: std.mem.Allocator) WsFrameParser {
-        _ = &std.ArrayList(u8).empty; // allocator no longer needed (ArrayList is unmanaged)
+    pub fn init(allocator: std.mem.Allocator) WsFrameParser {
         return .{
             .buf = .empty,
             .payload = .empty,
+            .gpa = allocator,
         };
     }
     pub fn deinit(self: *WsFrameParser) void {
-        self.buf.deinit();
-        self.payload.deinit();
+        self.buf.deinit(self.gpa);
+        self.payload.deinit(self.gpa);
     }
 
     const max_payload: usize = 1024 * 1024;
 
     /// Append received bytes to the parser buffer.
     pub fn push(self: *WsFrameParser, bytes: []const u8) !void {
-        try self.buf.appendSlice(bytes);
+        try self.buf.appendSlice(self.gpa, bytes);
     }
 
     /// Try to extract the next complete frame. On `.frame`, the payload slice is
@@ -275,7 +276,7 @@ pub const WsFrameParser = struct {
         // compaction below overwrites the front of `buf`, which can overlap the
         // payload region when remaining > off).
         self.payload.clearRetainingCapacity();
-        self.payload.appendSlice(data[off..total]) catch return .protocol_error;
+        self.payload.appendSlice(self.gpa, data[off..total]) catch return .protocol_error;
         if (masked) {
             var i: usize = 0;
             while (i < self.payload.items.len) : (i += 1) self.payload.items[i] ^= mask[i & 3];
@@ -409,18 +410,18 @@ const SelectStream = struct {
             }
             return @intCast(n);
         } else {
-            // std.posix.recv maps errno into a Zig error set; fold it into the
-            // SAME SockError set the Windows path returns. EAGAIN/EWOULDBLOCK ->
-            // WouldBlock (recoverable idle), peer-gone errnos -> ConnectionReset.
-            return std.posix.recv(s.handle, buffer, 0) catch |e| switch (e) {
-                error.WouldBlock => error.WouldBlock, // EAGAIN/EWOULDBLOCK
-                error.ConnectionResetByPeer, // ECONNRESET
-                error.ConnectionTimedOut, // ETIMEDOUT
-                error.SocketNotConnected, // ENOTCONN
-                error.ConnectionRefused, // ECONNREFUSED
-                => error.ConnectionReset,
-                else => error.Unexpected,
-            };
+            // Zig 0.16 removed std.posix.recv; use raw Linux recvfrom (no address needed).
+            const rc = std.os.linux.recvfrom(s.handle, buffer.ptr, buffer.len, 0, null, null);
+            const signed: isize = @bitCast(rc);
+            if (signed < 0) {
+                const err: std.os.linux.E = @enumFromInt(@as(u16, @intCast(-signed)));
+                return switch (err) {
+                    .AGAIN => error.WouldBlock,
+                    .CONNRESET, .TIMEDOUT, .NOTCONN, .CONNREFUSED => error.ConnectionReset,
+                    else => error.Unexpected,
+                };
+            }
+            return @intCast(rc);
         }
     }
     pub fn readv(s: SelectStream, iovecs: []std.posix.iovec) ReadError!usize {
@@ -451,21 +452,20 @@ const SelectStream = struct {
             }
             return @intCast(n);
         } else {
-            // POSIX send. MSG.NOSIGNAL suppresses SIGPIPE on a send to a closed
-            // socket (otherwise the default action kills the process); on platforms
-            // lacking it (macOS/iOS) we ignore SIGPIPE process-wide at connect and
-            // send with no flag (see `posix_send_flags`). Mirror the Windows write
-            // semantics: a timeout/backpressure/peer-gone send is a dead connection
-            // (ConnectionReset), NOT WouldBlock -- shares/pongs are tiny and must not
-            // spuriously "retry". (std.posix.send's error set treats ENOTCONN as
-            // unreachable, so a peer-gone write surfaces as EPIPE/ECONNRESET -- both mapped.)
-            return std.posix.send(s.handle, buffer, posix_send_flags) catch |e| switch (e) {
-                error.WouldBlock, // EAGAIN/EWOULDBLOCK (send timeout / backpressure)
-                error.BrokenPipe, // EPIPE (peer closed; SIGPIPE suppressed above)
-                error.ConnectionResetByPeer, // ECONNRESET
-                => error.ConnectionReset,
-                else => error.Unexpected,
-            };
+            // Zig 0.16 removed std.posix.send; use raw Linux sendto with MSG.NOSIGNAL.
+            const flags = posix_send_flags;
+            const rc = std.os.linux.sendto(s.handle, buffer.ptr, buffer.len, flags, null, 0);
+            const signed: isize = @bitCast(rc);
+            if (signed < 0) {
+                const err: std.os.linux.E = @enumFromInt(@as(u16, @intCast(-signed)));
+                return switch (err) {
+                    .AGAIN, // EAGAIN/EWOULDBLOCK (send timeout / backpressure)
+                    .PIPE, // EPIPE (peer closed; MSG.NOSIGNAL suppresses SIGPIPE)
+                    .CONNRESET => error.ConnectionReset,
+                    else => error.Unexpected,
+                };
+            }
+            return @intCast(rc);
         }
     }
     pub fn writev(s: SelectStream, iovecs: []const std.posix.iovec_const) WriteError!usize {
@@ -515,28 +515,126 @@ const BACKOFF_START_MS: i64 = 1000;
 const BACKOFF_MAX_MS: i64 = 30000;
 
 const Conn = struct {
-    netstream: std.net.Stream, // owns the socket handle
+    netstream: std.Io.net.Stream, // owns the socket handle
     client: ?tls.Client, // null => plaintext ws:// (local daemon); set => TLS wss:// (pool)
     timeout_ms: u32,
+
+    // --- Io.Reader / Io.Writer adapters for the TLS layer (0.16) ---
+    // The TLS Client in 0.16 takes (*Io.Reader, *Io.Writer) for the raw network
+    // transport instead of a stream object. These VTable adapters bridge
+    // SelectStream's poll+recv/send into the Io abstraction.
+    io_r_buf: [tls.Client.min_buffer_len]u8 = undefined,
+    io_w_buf: [tls.Client.min_buffer_len]u8 = undefined,
+    io_r: std.Io.Reader = undefined,
+    io_w: std.Io.Writer = undefined,
 
     fn stream(self: *Conn) SelectStream {
         return .{ .handle = self.netstream.socket.handle, .timeout_ms = self.timeout_ms };
     }
+
+    /// Initialise the Io.Reader / Io.Writer VTable adapters and perform the TLS handshake.
+    /// Must be called *after* the TCP socket is connected (netstream is live).
+    fn initTls(self: *Conn) !void {
+        self.io_r = .{
+            .vtable = &.{
+                .stream = netReaderStream,
+            },
+            .buffer = &self.io_r_buf,
+            .seek = 0,
+            .end = 0,
+        };
+        // Writer is unbuffered (buffer is empty) so drain is called on every write.
+        self.io_w = .{
+            .vtable = &.{
+                .drain = netWriterDrain,
+            },
+            .buffer = &self.io_w_buf,
+            .end = 0,
+        };
+        // TLS Client options: need write_buffer, read_buffer, entropy, realtime_now.
+        var entropy_buf: [tls.Client.Options.entropy_len]u8 = undefined;
+        // Fill entropy using the Linux getrandom syscall (std.crypto.random removed in 0.16).
+        {
+            var filled: usize = 0;
+            while (filled < entropy_buf.len) {
+                const rc = std.os.linux.getrandom(entropy_buf[filled..].ptr, entropy_buf.len - filled, 0);
+                const signed: isize = @bitCast(rc);
+                if (signed < 0) return error.Unexpected;
+                filled += @intCast(signed);
+            }
+        }
+        // Compute wall-clock realtime for certificate time validation.
+        var ts: std.posix.timespec = undefined;
+        _ = std.posix.system.clock_gettime(std.posix.CLOCK.REALTIME, &ts);
+        self.client = try tls.Client.init(&self.io_r, &self.io_w, .{
+            .host = .no_verification,
+            .ca = .no_verification,
+            .write_buffer = &self.io_w_buf,
+            .read_buffer = &self.io_r_buf,
+            .entropy = &entropy_buf,
+            .realtime_now = .{ .nanoseconds = @as(i96, ts.sec) * std.time.ns_per_s + @as(i96, ts.nsec) },
+        });
+    }
+
+    /// Io.Reader VTable `stream` function: read encrypted bytes from the network
+    /// socket into the Reader's internal buffer (or write them to `w`).
+    fn netReaderStream(r: *std.Io.Reader, w: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        _ = w;
+        const self: *Conn = @alignCast(@fieldParentPtr("io_r", r));
+        const s = self.stream();
+        // Read into the Reader's internal buffer (past end).
+        const available = limit.minInt(r.buffer.len - r.end);
+        if (available == 0) return 0;
+        const n = s.read(r.buffer[r.end .. r.end + available]) catch |e| switch (e) {
+            error.WouldBlock => return 0,
+            else => return error.ReadFailed,
+        };
+        if (n == 0) return error.EndOfStream;
+        r.end += n;
+        return n;
+    }
+
+    /// Io.Writer VTable `drain` function: send encrypted bytes over the network socket.
+    fn netWriterDrain(w: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+        const self: *Conn = @alignCast(@fieldParentPtr("io_w", w));
+        const s = self.stream();
+        var total: usize = 0;
+        for (data) |d| {
+            var i: usize = 0;
+            while (i < d.len) {
+                const n = s.write(d[i..]) catch return error.WriteFailed;
+                if (n == 0) return if (total > 0) total else error.WriteFailed;
+                i += n;
+                total += n;
+            }
+        }
+        _ = splat;
+        return total;
+    }
+
     // Unified app I/O so the upgrade handshake, frame reads, and share writes are
     // transport-agnostic: TLS when a client is present, else the raw socket.
     fn read(self: *Conn, buffer: []u8) !usize {
-        if (self.client) |*c| return c.read(self.stream(), buffer);
+        if (self.client) |*c| {
+            // TLS: read decrypted data from the Client's application reader.
+            return c.reader.readSliceShort(buffer);
+        }
         return self.stream().read(buffer);
     }
     fn writeAll(self: *Conn, bytes: []const u8) !void {
-        if (self.client) |*c| return c.writeAll(self.stream(), bytes);
+        if (self.client) |*c| {
+            // TLS: write plaintext through the Client's application writer.
+            try c.writer.writeAll(bytes);
+            return;
+        }
         const s = self.stream();
         var off: usize = 0;
         while (off < bytes.len) off += try s.write(bytes[off..]);
     }
     fn close(self: *Conn) void {
-        // Close on the same thread that reads -- no cross-thread unblock needed.
-        self.netstream.close();
+        // Close the socket fd directly — std.Io.net.Stream.close requires an Io
+        // handle that we don't have in this minimal adapter.
+        _ = std.os.linux.close(self.netstream.socket.handle);
     }
 };
 
@@ -545,7 +643,7 @@ const Conn = struct {
 /// bytes that arrived past the `\r\n\r\n` (a coalesced first frame; seed the
 /// parser with them). Caller owns the returned Conn and must `close` it.
 fn connectAndUpgrade(
-    _: std.mem.Allocator, // unused since we switched to libc getaddrinfo (no list walk)
+    allocator: std.mem.Allocator,
     cfg: Config,
     hooks: Hooks,
     leftover_out: *std.ArrayList(u8),
@@ -614,10 +712,7 @@ fn connectAndUpgrade(
     //      Skipped for plaintext ws:// (a local derod daemon): the client stays null
     //      and Conn.read/writeAll route straight to the raw socket. ----
     if (cfg.tls) {
-        conn.client = try tls.Client.init(conn.stream(), .{
-            .host = .no_verification,
-            .ca = .no_verification,
-        });
+        try conn.initTls();
     }
 
     // ---- HTTP upgrade ----
@@ -643,7 +738,7 @@ fn connectAndUpgrade(
         // Honor shutdown mid-handshake, and bound a peer that trickles bytes
         // forever (defeating the per-read timeout) -- both guards the C has.
         if (hooks.should_quit(hooks.ctx)) return error.Shutdown;
-        if (std.time.milliTimestamp() - connect_start >= CONNECT_DEADLINE_MS) return error.UpgradeStalled;
+        if (nowMsMonotonic() - connect_start >= CONNECT_DEADLINE_MS) return error.UpgradeStalled;
         const n = conn.read(resp[total..]) catch |e| {
             // A timeout during upgrade is treated as a stalled handshake.
             if (e == error.WouldBlock) return error.UpgradeStalled;
@@ -665,7 +760,7 @@ fn connectAndUpgrade(
 
     // Seed the WS parser with any bytes that coalesced past the header (the C
     // discards these -- a latent bug; we don't).
-    if (total > header_end) try leftover_out.appendSlice(resp[header_end..total]);
+    if (total > header_end) try leftover_out.appendSlice(allocator, resp[header_end..total]);
 
     // Switch to the fast mining-loop read timeout now that we're upgraded.
     conn.timeout_ms = MINING_TIMEOUT_MS;
@@ -705,7 +800,11 @@ fn setSndTimeout(handle: std.posix.socket_t, ms: u32) void {
 /// Send a masked WebSocket frame over the connection (TLS or plaintext).
 fn sendFrame(conn: *Conn, scratch: []u8, opcode: u8, payload: []const u8) !void {
     var mask: [4]u8 = undefined;
-    std.crypto.random.bytes(&mask);
+    {
+        const rc = std.os.linux.getrandom(&mask, mask.len, 0);
+        const signed: isize = @bitCast(rc);
+        if (signed < 0) return error.Unexpected;
+    }
     const frame = wsEncodeFrame(scratch, opcode, payload, mask);
     try conn.writeAll(frame);
 }
@@ -717,7 +816,7 @@ pub fn run(allocator: std.mem.Allocator, cfg: Config, hooks: Hooks) void {
 
     while (!hooks.should_quit(hooks.ctx)) {
         var leftover = std.ArrayList(u8).empty;
-        defer leftover.deinit();
+        defer leftover.deinit(allocator);
 
         var conn = connectAndUpgrade(allocator, cfg, hooks, &leftover) catch |err| {
             if (err == error.Shutdown or hooks.should_quit(hooks.ctx)) break;
@@ -875,7 +974,7 @@ fn backoffSleep(hooks: Hooks, ms: i64) void {
     var remaining = ms;
     while (remaining > 0 and !hooks.should_quit(hooks.ctx)) {
         const slice = @min(remaining, SLICE);
-        sleepMs(slice);
+        sleepMs(@intCast(slice));
         remaining -= slice;
     }
 }

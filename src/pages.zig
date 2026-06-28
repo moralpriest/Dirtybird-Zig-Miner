@@ -84,7 +84,7 @@ fn allocLinuxThp(size: usize) ?PageBacking {
     const mapping = std.posix.mmap(
         null,
         mapped_len,
-        std.posix.PROT.READ | std.posix.PROT.WRITE,
+        .{ .READ = true, .WRITE = true },
         flags,
         -1,
         0,
