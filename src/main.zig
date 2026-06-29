@@ -13,6 +13,11 @@ const cpu_features = @import("cpu_features.zig");
 
 const VERSION = "0.2.0";
 
+pub const std_options: std.Options = .{
+    .signal_stack_size = 0,
+    .enable_segfault_handler = false,
+};
+
 var G: state.MinerState = .{};
 
 // std.time.milliTimestamp / std.time.sleep were removed in Zig 0.16. We use the libc

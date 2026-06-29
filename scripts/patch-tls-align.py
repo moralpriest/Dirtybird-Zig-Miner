@@ -55,11 +55,9 @@ def patch_tls(path: str, min_align: int = 64):
             #    Do NOT touch p_memsz — it determines TLS block size and
             #    all compiled-in TLS variable offsets.
             #
-            #    We shift FORWARD (p_vaddr + padding) rather than backward
-            #    (p_vaddr - skew) to keep p_vaddr in the anonymous gap
-            #    between LOAD segments. Shifting backward lands the TLS
-            #    block inside a READ-EXECUTE LOAD segment, causing
-            #    SEGV_ACCERR when the Zig runtime writes to TLS variables.
+            #    With signal_stack_size=0, TLS is only ~328 bytes and
+            #    naturally lands just past LOAD #2. A small shift to the
+            #    next 64-byte boundary is sufficient.
             skew = p_vaddr % p_align
             if skew != 0:
                 new_vaddr = p_vaddr + (p_align - skew)
