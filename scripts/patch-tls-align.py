@@ -54,9 +54,15 @@ def patch_tls(path: str, min_align: int = 64):
             # 2. Fix p_vaddr skew (p_vaddr must be aligned to p_align)
             #    Do NOT touch p_memsz — it determines TLS block size and
             #    all compiled-in TLS variable offsets.
+            #
+            #    We shift FORWARD (p_vaddr + padding) rather than backward
+            #    (p_vaddr - skew) to keep p_vaddr in the anonymous gap
+            #    between LOAD segments. Shifting backward lands the TLS
+            #    block inside a READ-EXECUTE LOAD segment, causing
+            #    SEGV_ACCERR when the Zig runtime writes to TLS variables.
             skew = p_vaddr % p_align
             if skew != 0:
-                new_vaddr = p_vaddr - skew
+                new_vaddr = p_vaddr + (p_align - skew)
                 f.seek(off + 16)
                 f.write(struct.pack('<Q', new_vaddr))
                 f.seek(off + 24)
