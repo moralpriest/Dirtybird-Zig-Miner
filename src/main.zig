@@ -135,9 +135,12 @@ fn powKat(alloc: std.mem.Allocator, hex_out: *[64]u8) !bool {
     return std.mem.eql(u8, hex_out, expected);
 }
 
-fn selftest(alloc: std.mem.Allocator) !u8 {
+fn selftest(alloc: std.mem.Allocator) u8 {
     var hex: [64]u8 = undefined;
-    const pass = try powKat(alloc, &hex);
+    const pass = powKat(alloc, &hex) catch |e| {
+        std.debug.print("selftest error: {s}\n", .{@errorName(e)});
+        return 1;
+    };
     std.debug.print("selftest pow(a): {s} {s}\n", .{ hex, if (pass) "PASS" else "FAIL" });
     return if (pass) 0 else 1;
 }
@@ -412,6 +415,14 @@ pub fn main(init: std.process.Init) !u8 {
     const args = try args_list.toOwnedSlice(alloc);
     defer alloc.free(args);
 
+    // Debug: dump received args
+    std.debug.print("DEBUG: argc={d}\n", .{args.len});
+    for (args, 0..) |arg, idx| {
+        std.debug.print("DEBUG: argv[{d}] len={d} hex=", .{ idx, arg.len });
+        for (arg) |ch| std.debug.print("{x:0>2}", .{ch});
+        std.debug.print("\n", .{});
+    }
+
     var do_selftest = false;
     var do_setup = false;
     var nthreads: usize = 0;
@@ -517,7 +528,10 @@ pub fn main(init: std.process.Init) !u8 {
         return 0;
     }
 
-    if (do_selftest) return selftest(alloc);
+    if (do_selftest) {
+        const rc = selftest(alloc);
+        std.process.exit(rc);
+    }
 
     if (G.wallet.len == 0) {
         std.debug.print("error: -w <wallet> is required\n", .{});
