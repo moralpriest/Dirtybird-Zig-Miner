@@ -6,7 +6,11 @@ Bionic requires:
   2. p_vaddr % p_align == 0  (skew must be 0)
 
 musl static-pie binaries default to p_align=8 with arbitrary p_vaddr,
-which Bionic rejects. This script fixes both p_align and p_vaddr in one pass.
+which Bionic rejects. This script fixes both p_align and p_vaddr.
+
+IMPORTANT: p_memsz is NEVER modified. Changing it breaks all compiled-in
+TLS variable offsets because musl and the compiler bake in offsets based
+on the original p_memsz. Only p_vaddr and p_align are patched.
 
 Usage:
     python3 scripts/patch-tls-align.py <binary> [min_align=64]
@@ -33,8 +37,6 @@ def patch_tls(path: str, min_align: int = 64):
             # Read current values
             f.seek(off + 16)
             p_vaddr = struct.unpack('<Q', f.read(8))[0]
-            f.seek(off + 24)
-            p_paddr = struct.unpack('<Q', f.read(8))[0]
             f.seek(off + 40)
             p_memsz = struct.unpack('<Q', f.read(8))[0]
             f.seek(off + 48)
@@ -50,28 +52,29 @@ def patch_tls(path: str, min_align: int = 64):
                 print(f"  p_align: -> {min_align}")
 
             # 2. Fix p_vaddr skew (p_vaddr must be aligned to p_align)
+            #    Do NOT touch p_memsz — it determines TLS block size and
+            #    all compiled-in TLS variable offsets.
             skew = p_vaddr % p_align
             if skew != 0:
                 new_vaddr = p_vaddr - skew
-                new_memsz = p_memsz + skew
                 f.seek(off + 16)
                 f.write(struct.pack('<Q', new_vaddr))
                 f.seek(off + 24)
                 f.write(struct.pack('<Q', new_vaddr))  # p_paddr = p_vaddr
-                f.seek(off + 40)
-                f.write(struct.pack('<Q', new_memsz))
                 print(f"  p_vaddr: 0x{p_vaddr:x} -> 0x{new_vaddr:x} (skew {skew} -> 0)")
-                print(f"  p_memsz: 0x{p_memsz:x} -> 0x{new_memsz:x}")
+                print(f"  p_memsz: UNCHANGED (0x{p_memsz:x})")
             else:
                 print(f"  p_vaddr already aligned (skew=0)")
 
             # Verify
             f.seek(off + 16)
             v = struct.unpack('<Q', f.read(8))[0]
+            f.seek(off + 40)
+            m = struct.unpack('<Q', f.read(8))[0]
             f.seek(off + 48)
             a = struct.unpack('<Q', f.read(8))[0]
             final_skew = v % a
-            print(f"  VERIFIED: p_vaddr=0x{v:x} p_align={a} skew={final_skew}")
+            print(f"  VERIFIED: p_vaddr=0x{v:x} p_memsz=0x{m:x} p_align={a} skew={final_skew}")
             return
 
         print("WARNING: no PT_TLS segment found", file=sys.stderr)
