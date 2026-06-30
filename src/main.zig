@@ -404,19 +404,17 @@ pub fn main(init: std.process.Init) !u8 {
 
     var arg_it = std.process.Args.Iterator.init(init.minimal.args);
     defer arg_it.deinit();
-    var first = true;
     while (arg_it.next()) |arg| {
-        if (first) {
-            first = false;
-            continue; // skip argv[0]
-        }
         try args_list.append(alloc, arg);
     }
-    const args = try args_list.toOwnedSlice(alloc);
-    defer alloc.free(args);
+    const all_args = try args_list.toOwnedSlice(alloc);
+    defer alloc.free(all_args);
+
+    // Skip argv[0] explicitly (more reliable than iterator first-element logic on Android)
+    const args = if (all_args.len > 0) all_args[1..] else &[_][]const u8{};
 
     // Debug: dump received args
-    std.debug.print("DEBUG: argc={d}\n", .{args.len});
+    std.debug.print("DEBUG: BUILD=fix-argv-slice argc={d}\n", .{args.len});
     for (args, 0..) |arg, idx| {
         std.debug.print("DEBUG: argv[{d}] len={d} hex=", .{ idx, arg.len });
         for (arg) |ch| std.debug.print("{x:0>2}", .{ch});
