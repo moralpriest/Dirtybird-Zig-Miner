@@ -402,24 +402,22 @@ pub fn main(init: std.process.Init) !u8 {
     var args_list: std.ArrayList([]const u8) = .empty;
     defer args_list.deinit(alloc);
 
-    var arg_it = std.process.Args.Iterator.init(init.minimal.args);
-    defer arg_it.deinit();
-    while (arg_it.next()) |arg| {
-        try args_list.append(alloc, arg);
+    // Collect args from iterator, skipping argv[0] by counting.  The Zig stdlib
+    // iterator and a naive `all_args[1..]` slice both misbehave on Android (extra
+    // leading empty element or broken first-element skip), so we rely on the fact
+    // that only argv[0] can be a non-flag (no leading `-`).  Every flag starts
+    // with `-`, so we simply skip args that don't.
+    {
+        var arg_it = std.process.Args.Iterator.init(init.minimal.args);
+        defer arg_it.deinit();
+        while (arg_it.next()) |arg| {
+            if (arg.len > 0 and arg[0] == '-') {
+                try args_list.append(alloc, arg);
+            }
+        }
     }
-    const all_args = try args_list.toOwnedSlice(alloc);
-    defer alloc.free(all_args);
-
-    // Skip argv[0] explicitly (more reliable than iterator first-element logic on Android)
-    const args = if (all_args.len > 0) all_args[1..] else &[_][]const u8{};
-
-    // Debug: dump received args
-    std.debug.print("DEBUG: BUILD=fix-argv-slice argc={d}\n", .{args.len});
-    for (args, 0..) |arg, idx| {
-        std.debug.print("DEBUG: argv[{d}] len={d} hex=", .{ idx, arg.len });
-        for (arg) |ch| std.debug.print("{x:0>2}", .{ch});
-        std.debug.print("\n", .{});
-    }
+    const args = try args_list.toOwnedSlice(alloc);
+    defer alloc.free(args);
 
     var do_selftest = false;
     var do_setup = false;
